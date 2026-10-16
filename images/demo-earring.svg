@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1125" width="900" height="1125" role="img" aria-label="首饰">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#F5F0EE"/>
+      <stop offset="100%" stop-color="#F5F0EE"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="900" height="1125" fill="url(#bg)"/>
+  <rect width="900" height="1125" fill="url(#glow)"/>
+  <circle cx="450" cy="470" r="286" fill="#FFFFFF" opacity="0.55"/>
+  <circle cx="450" cy="470" r="286" fill="none" stroke="#D8C0B6" stroke-opacity="0.35"/>
+  <g fill="none" stroke="#7C675E" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" opacity="0.82">
+    <circle cx="450" cy="560" r="76" fill="none"/><path d="M450 356 L450 400" stroke-dasharray="8 8"/><path d="M450 400 C398 424 398 476 450 484 C502 476 502 424 450 400 Z"/><circle cx="450" cy="560" r="26"/><path d="M330 700 C390 660 510 660 570 700" stroke-dasharray="6 10"/>
+  </g>
+  <g font-family="'PingFang SC','Microsoft YaHei','Helvetica Neue',Helvetica,Arial,sans-serif" text-anchor="middle">
+    <text x="450" y="930" font-size="34" letter-spacing="14" fill="#7C675E" opacity="0.85">JEWELRY</text>
+    <text x="450" y="982" font-size="26" letter-spacing="3" fill="#7C675E" opacity="0.5">首饰</text>
+    <text x="450" y="1032" font-size="21" letter-spacing="2" fill="#7C675E" opacity="0.34">示例图片 · 请替换为你的商品照片</text>
+  </g>
+</svg>

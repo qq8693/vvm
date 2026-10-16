@@ -1,0 +1,23 @@
+# ---- 系统 / 编辑器 ----
+.DS_Store
+Thumbs.db
+desktop.ini
+*.swp
+*~
+.idea/
+.vscode/
+
+# ---- Python ----
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ---- 数据备份（本地自动生成，不需要上传）----
+data/products.js.bak
+data/*.bak
+
+# ---- 临时 / 测试产物 ----
+_tools/tmp/
+*.log

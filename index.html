@@ -1,0 +1,181 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>我的小店</title>
+<meta name="description" content="我的小店 · 精选好物在线展示">
+<meta name="theme-color" content="#ffffff">
+<meta name="format-detection" content="telephone=no">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='8' fill='%2314161a'/%3E%3Cpath d='M10 20.5c4.5 2 8.5-1.5 12-9' stroke='%23fff' stroke-width='2.6' stroke-linecap='round' fill='none'/%3E%3C/svg%3E">
+
+<!-- 社交分享：把 og:url 换成你以后的 GitHub Pages 地址即可 -->
+<meta property="og:type" content="website">
+<meta property="og:title" content="我的小店">
+<meta property="og:description" content="精选好物在线展示，欢迎咨询">
+<meta name="twitter:card" content="summary_large_image">
+
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+<!-- 顶部公告 -->
+<div class="announce" id="announce" hidden></div>
+
+<!-- 页头 -->
+<header class="site-header">
+  <div class="wrap header-inner">
+    <a class="brand" href="#all">
+      <span class="brand-mark" id="brandName">我的小店</span>
+      <span class="brand-sub" id="brandSub"></span>
+    </a>
+
+    <nav class="nav" id="nav"></nav>
+
+    <div class="header-tools">
+      <button class="icon-btn" id="searchBtn" data-i18n-title="search.title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      </button>
+      <button class="icon-btn" id="favToggle" data-i18n-title="fav.only" style="position:relative">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round"><path d="M20.8 4.6a5.5 5.5 0 0 0-7.8 0L12 5.7l-1-1.1a5.5 5.5 0 0 0-7.8 7.8l1.1 1L12 21.2l7.7-7.8 1.1-1a5.5 5.5 0 0 0 0-7.8z"/></svg>
+        <span class="count" id="favCount" hidden>0</span>
+      </button>
+      <button class="lang-btn" id="langBtn" hidden>
+        <svg width="14" height="14" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="9"/><path d="M3 12h18M12 3a15 15 0 0 1 0 18a15 15 0 0 1 0-18z"/></svg>
+        <span>English</span>
+      </button>
+      <button class="btn btn-primary btn-sm" id="contactBtn" data-i18n="contact.btn">联系店主</button>
+      <button class="icon-btn menu-btn" id="menuBtn" data-i18n-title="search.title">
+        <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><path d="M3 6h18M3 12h18M3 18h18"/></svg>
+      </button>
+    </div>
+  </div>
+
+  <div class="wrap search-row" id="searchRow">
+    <div class="search">
+      <svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round"><circle cx="11" cy="11" r="7"/><path d="M20 20l-3.6-3.6"/></svg>
+      <input id="q" type="search" data-i18n-ph="search.ph" autocomplete="off">
+      <button class="icon-btn" id="clearQ" hidden style="width:24px;height:24px" data-i18n-title="search.clear">
+        <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.4" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+      </button>
+    </div>
+  </div>
+</header>
+
+<!-- 首屏 -->
+<section class="hero" id="hero" hidden>
+  <div class="wrap hero-grid">
+    <div>
+      <div class="hero-eyebrow" data-i18n="hero.eyebrow">在线店铺</div>
+      <h1 id="heroTitle"></h1>
+      <p id="heroSub"></p>
+      <div class="hero-actions">
+        <a class="btn btn-primary" id="heroBtn" href="#products" data-i18n="hero.browse">浏览全部商品</a>
+        <button class="btn btn-ghost" id="contactBtn2" data-i18n="hero.contact">直接联系</button>
+      </div>
+      <div class="stats" id="heroStats" hidden></div>
+    </div>
+    <div class="hero-visual" id="heroVisual"></div>
+  </div>
+</section>
+
+<!-- 商品区 -->
+<section class="section" id="products">
+  <div class="wrap">
+
+    <div class="section-head">
+      <div>
+        <h2 id="secTitle" data-i18n="section.all">全部商品</h2>
+        <div class="hint" id="countText"></div>
+      </div>
+      <div class="hint" id="updated"></div>
+    </div>
+
+    <div class="toolbar">
+      <div class="chips" id="chips"></div>
+      <div class="toolbar-right">
+        <select class="select" id="sort" aria-label="sort">
+          <option value="default" data-i18n="sort.default">推荐排序</option>
+          <option value="new" data-i18n="sort.new">最新上架</option>
+          <option value="price-asc" data-i18n="sort.asc">价格从低到高</option>
+          <option value="price-desc" data-i18n="sort.desc">价格从高到低</option>
+        </select>
+      </div>
+    </div>
+
+    <!-- 加载骨架 -->
+    <div class="grid" id="loading">
+      <div><div class="sk sk-media"></div><div class="sk sk-line"></div><div class="sk sk-line w34"></div></div>
+      <div><div class="sk sk-media"></div><div class="sk sk-line"></div><div class="sk sk-line w34"></div></div>
+      <div><div class="sk sk-media"></div><div class="sk sk-line"></div><div class="sk sk-line w34"></div></div>
+      <div><div class="sk sk-media"></div><div class="sk sk-line"></div><div class="sk sk-line w34"></div></div>
+    </div>
+
+    <div class="grid" id="grid"></div>
+    <div class="empty" id="empty" hidden></div>
+
+    <div style="text-align:center;margin-top:52px">
+      <button class="btn btn-ghost" id="moreBtn" hidden>加载更多</button>
+    </div>
+
+  </div>
+</section>
+
+<!-- 页脚 -->
+<footer class="site-footer">
+  <div class="wrap">
+    <div class="footer-grid">
+      <div class="footer-brand">
+        <div class="brand-mark" id="footBrand"></div>
+        <p id="footDesc"></p>
+      </div>
+      <div>
+        <h4 data-i18n="footer.contact">联系方式</h4>
+        <ul class="footer-list" id="footContact"></ul>
+        <button class="btn btn-ghost btn-sm" id="footContactBtn" style="margin-top:14px" data-i18n="footer.qr">查看二维码 / 复制</button>
+      </div>
+      <div>
+        <h4 data-i18n="footer.cats">商品分类</h4>
+        <ul class="footer-list" id="footLinks"></ul>
+      </div>
+    </div>
+    <div class="footer-bottom">
+      <span id="footCopy"></span>
+      <span id="footExtra" hidden></span>
+    </div>
+  </div>
+</footer>
+
+<!-- 商品详情 -->
+<div class="modal" id="modal" hidden role="dialog" aria-modal="true">
+  <div class="modal-bg" id="modalBg"></div>
+  <div class="modal-panel">
+    <button class="modal-close" id="modalClose" aria-label="close">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+    <div id="modalBody" style="display:contents"></div>
+  </div>
+</div>
+
+<!-- 联系方式 -->
+<div class="modal" id="contact" hidden role="dialog" aria-modal="true">
+  <div class="modal-bg" id="contactBg"></div>
+  <div class="contact-panel">
+    <button class="modal-close" id="contactClose" aria-label="close">
+      <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2.2" stroke-linecap="round"><path d="M18 6 6 18M6 6l12 12"/></svg>
+    </button>
+    <div id="contactBody"></div>
+  </div>
+</div>
+
+<div class="toast" id="toast"></div>
+
+<button class="to-top" id="toTop" aria-label="top">
+  <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 19V5M5 12l7-7 7 7"/></svg>
+</button>
+
+<!-- 商品数据：由管理工具导出并覆盖本文件 -->
+<script src="data/products.js"></script>
+<script src="assets/app.js"></script>
+</body>
+</html>

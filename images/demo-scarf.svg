@@ -1,0 +1,25 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 900 1125" width="900" height="1125" role="img" aria-label="丝巾 / 配饰">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="0.35" y2="1">
+      <stop offset="0%" stop-color="#FFFFFF"/>
+      <stop offset="55%" stop-color="#F4EEEA"/>
+      <stop offset="100%" stop-color="#F4EEEA"/>
+    </linearGradient>
+    <radialGradient id="glow" cx="50%" cy="38%" r="62%">
+      <stop offset="0%" stop-color="#FFFFFF" stop-opacity="0.95"/>
+      <stop offset="100%" stop-color="#FFFFFF" stop-opacity="0"/>
+    </radialGradient>
+  </defs>
+  <rect width="900" height="1125" fill="url(#bg)"/>
+  <rect width="900" height="1125" fill="url(#glow)"/>
+  <circle cx="450" cy="470" r="286" fill="#FFFFFF" opacity="0.55"/>
+  <circle cx="450" cy="470" r="286" fill="none" stroke="#D5BCAE" stroke-opacity="0.35"/>
+  <g fill="none" stroke="#7A665C" stroke-width="9" stroke-linecap="round" stroke-linejoin="round" opacity="0.82">
+    <path d="M330 360 C400 300 500 420 570 360"/><path d="M330 360 L330 640 L400 700 L400 420"/><path d="M570 360 L570 640 L500 700 L500 420"/><path d="M348 470 L386 470 M548 470 L510 470"/>
+  </g>
+  <g font-family="'PingFang SC','Microsoft YaHei','Helvetica Neue',Helvetica,Arial,sans-serif" text-anchor="middle">
+    <text x="450" y="930" font-size="34" letter-spacing="14" fill="#7A665C" opacity="0.85">SCARF</text>
+    <text x="450" y="982" font-size="26" letter-spacing="3" fill="#7A665C" opacity="0.5">丝巾 / 配饰</text>
+    <text x="450" y="1032" font-size="21" letter-spacing="2" fill="#7A665C" opacity="0.34">示例图片 · 请替换为你的商品照片</text>
+  </g>
+</svg>
