@@ -9,17 +9,29 @@ echo   仓库：https://github.com/qq8693/vvm
 echo ============================================================
 echo.
 
+rem ---------- 找 git：先查 PATH，找不到就用已知安装位置 ----------
+set "GIT=git"
 where git >nul 2>&1
-if errorlevel 1 (
-  echo   !! 没有找到 git 命令，请先安装 Git for Windows 后再试。
-  goto end
-)
+if not errorlevel 1 goto havegit
 
-git add -A
+set "GIT="
+if exist "%ProgramFiles%\WorkBuddy\resources\vendor\PortableGit\cmd\git.exe" set "GIT=%ProgramFiles%\WorkBuddy\resources\vendor\PortableGit\cmd\git.exe"
+if not defined GIT if exist "%LOCALAPPDATA%\Programs\Git\cmd\git.exe" set "GIT=%LOCALAPPDATA%\Programs\Git\cmd\git.exe"
+if not defined GIT if exist "%ProgramFiles%\Git\cmd\git.exe" set "GIT=%ProgramFiles%\Git\cmd\git.exe"
+if not defined GIT goto nogit
+
+for %%i in ("%GIT%") do set "GITDIR=%%~dpi"
+set "PATH=%GITDIR%%PATH%"
+echo   提示：PATH 里没有 git，已改用 %GIT%
+echo.
+
+:havegit
+
+"%GIT%" add -A
 if errorlevel 1 goto fail
 
 echo [1/3] 已暂存改动，正在提交...
-git commit -m "Update products"
+"%GIT%" commit -m "Update products"
 if errorlevel 1 (
   echo.
   echo   没有新的改动需要提交，直接尝试推送...
@@ -31,7 +43,7 @@ set "TRY=0"
 
 :push
 set /a TRY+=1
-git push origin main
+"%GIT%" push origin main
 if not errorlevel 1 goto pushed
 if %TRY% geq 3 goto fail
 echo.
@@ -46,6 +58,14 @@ echo.
 echo   仓库地址：https://github.com/qq8693/vvm
 echo   网站地址：https://qq8693.github.io/vvm/
 echo   （网站生效一般要等 1-3 分钟）
+echo.
+goto end
+
+:nogit
+echo.
+echo   !! 这台电脑上没有找到 git。
+echo   请先安装 Git for Windows：https://git-scm.com/download/win
+echo   安装时保持默认选项（会写入 PATH），装完重新双击本脚本即可。
 echo.
 goto end
 
