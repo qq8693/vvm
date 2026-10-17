@@ -20,4 +20,6 @@ data/*.bak
 
 # ---- 临时 / 测试产物 ----
 _tools/tmp/
+_tools/_*
+_tools/*.log
 *.log
