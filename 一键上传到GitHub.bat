@@ -1,41 +1,50 @@
 @echo off
-chcp 65001 >nul
+chcp 936 >nul 2>&1
+setlocal
 cd /d "%~dp0"
+
 echo ============================================================
-echo   一键上传到 GitHub
-echo   仓库：https://github.com/qq8693/vvm
+echo   һ���ϴ��� GitHub
+echo   �ֿ⣺https://github.com/qq8693/vvm
 echo ============================================================
 echo.
+
+where git >nul 2>&1
+if errorlevel 1 (
+  echo   !! û���ҵ� git ������Ȱ�װ Git for Windows �����ԡ�
+  goto end
+)
 
 git add -A
 if errorlevel 1 goto fail
 
-echo [1/3] 已暂存改动，正在提交...
-git commit -m "更新商品 %date% %time:~0,8%"
+echo [1/3] ���ݴ�Ķ��������ύ...
+git commit -m "Update products"
 if errorlevel 1 (
   echo.
-  echo   没有新的改动需要提交（或者提交被跳过），继续尝试推送...
+  echo   û���µĸĶ���Ҫ�ύ��ֱ�ӳ�������...
 )
 
 echo.
-echo [2/3] 正在推送到 GitHub...
+echo [2/3] �������͵� GitHub...
 git push origin main
 if errorlevel 1 goto fail
 
 echo.
-echo [3/3] 完成！
+echo [3/3] ��ɣ�
 echo.
-echo   仓库地址：https://github.com/qq8693/vvm
-echo   网站地址：https://qq8693.github.io/vvm/
-echo   （网站地址首次部署后可能要等 1-3 分钟才生效）
+echo   �ֿ��ַ��https://github.com/qq8693/vvm
+echo   ��վ��ַ��https://qq8693.github.io/vvm/
+echo   ����վ��Чһ��Ҫ�� 1-3 ���ӣ�
 echo.
 goto end
 
 :fail
 echo.
-echo   !! 出错了，请看上面的提示。
-echo   常见原因：网络不通 / 没登录 GitHub / 有冲突需要先 pull。
+echo   !! �����ˣ��뿴�������ʾ��
+echo   ����ԭ�����粻ͨ / ��û��¼ GitHub / Զ�������ύҪ�� pull��
 echo.
 
 :end
+echo.
 pause

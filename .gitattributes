@@ -1,0 +1,5 @@
+# Windows 批处理脚本：统一用 CRLF 行尾
+# 注意：本仓库里的 .bat 含中文提示，文件编码必须保持 GBK(ANSI)，
+#      用 UTF-8 保存会导致双击运行时命令窗口中文乱码。
+*.bat text eol=crlf
+*.cmd text eol=crlf
