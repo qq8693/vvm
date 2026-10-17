@@ -46,6 +46,10 @@
       'updated.at': '更新于 {d}',
       'more': '加载更多',
       'more.n': '加载更多（还有 {n} 件）',
+      'pager.prev': '上一页',
+      'pager.next': '下一页',
+      'pager.info': '共 {total} 件商品',
+      'gallery.of': '{a} / {b}',
       'empty.nomatch': '没有找到符合条件的商品',
       'empty.usereset': '换个关键词或分类试试',
       'empty.reset': '清除筛选条件',
@@ -117,6 +121,10 @@
       'updated.at': 'Updated {d}',
       'more': 'Load More',
       'more.n': 'Load More ({n} left)',
+      'pager.prev': 'Prev',
+      'pager.next': 'Next',
+      'pager.info': '{total} items',
+      'gallery.of': '{a} / {b}',
       'empty.nomatch': 'No products found',
       'empty.usereset': 'Try a different keyword or category',
       'empty.reset': 'Clear filters',
@@ -235,7 +243,7 @@
     favOnly: false,
     favs: [],
     page: 1,
-    perPage: 60
+    perPage: 24
   };
 
   var LANG_KEY = 'shop_lang';
@@ -659,7 +667,10 @@
       };
     } else {
       $('#empty').hidden = true;
-      $('#grid').innerHTML = list.slice(0, STATE.page * STATE.perPage).map(cardHTML).join('');
+      var maxPage = Math.max(1, Math.ceil(list.length / STATE.perPage));
+      if (STATE.page > maxPage) STATE.page = maxPage;
+      var start = (STATE.page - 1) * STATE.perPage;
+      $('#grid').innerHTML = list.slice(start, start + STATE.perPage).map(cardHTML).join('');
     }
 
     $('#countText').textContent = list.length ? t('section.count', { n: list.length }) : '';
@@ -667,19 +678,55 @@
       var c = STATE.data.categories.filter(function (x) { return x.id === STATE.cat; })[0];
       return c ? pick(c, 'name') : t('section.all');
     })();
-    updateMoreBtn();
+    renderPager(list.length);
   }
 
-  function updateMoreBtn() {
-    var total = visible().length;
-    var left = Math.max(0, total - STATE.page * STATE.perPage);
-    var b = $('#moreBtn');
-    b.hidden = left <= 0;
-    b.textContent = t('more');
+  /* ------------------------------ 分页条 ------------------------------- */
+  function pageItems(cur, total) {
+    /* 生成页码数组：1 … (c-1) c (c+1) … total，中间最多 5 个 */
+    var out = [];
+    for (var i = 1; i <= total; i++) {
+      if (i === 1 || i === total || Math.abs(i - cur) <= 1) { out.push(i); continue; }
+      if (out[out.length - 1] !== '…') out.push('…');
+    }
+    return out;
+  }
+
+  function renderPager(total) {
+    var box = $('#pager');
+    var pages = Math.max(1, Math.ceil(total / STATE.perPage));
+    if (pages <= 1) { box.hidden = true; box.innerHTML = ''; return; }
+    if (STATE.page > pages) STATE.page = pages;
+
+    var btn = function (label, page, cls, disabled, aria) {
+      return '<button class="' + cls + '"' + (disabled ? ' disabled' : '') +
+        (aria ? ' aria-label="' + escA(aria) + '"' : '') +
+        ' data-page="' + page + '">' + label + '</button>';
+    };
+    var html = btn('<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg>',
+        STATE.page - 1, 'pg-nav', STATE.page <= 1, t('pager.prev'));
+    pageItems(STATE.page, pages).forEach(function (it) {
+      if (it === '…') { html += '<span class="pg-dots">…</span>'; return; }
+      html += btn(String(it), it, 'pg-num' + (it === STATE.page ? ' is-active' : ''), false);
+    });
+    html += btn('<svg width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg>',
+        STATE.page + 1, 'pg-nav', STATE.page >= pages, t('pager.next'));
+
+    box.innerHTML = html +
+      '<span class="pg-info">' + t('pager.info', { total: total }) + '</span>';
+    box.hidden = false;
+  }
+
+  function gotoPage(p) {
+    STATE.page = p;
+    renderGrid();
+    var anchor = $('#products').offsetTop - 80;
+    window.scrollTo({ top: anchor < 0 ? 0 : anchor, behavior: 'smooth' });
   }
 
   /* ============================== 详情弹层 ============================== */
   var MODAL = { id: null, size: '', color: '' };
+  var galleryKeys = null;   // 弹窗内的 ←/→ 翻图监听（关闭时移除）
 
   function openDetail(id) {
     var p = STATE.data.products.filter(function (x) { return x.id === id; })[0];
@@ -746,8 +793,17 @@
     $('#modalBody').innerHTML =
       '<div class="gallery">' +
         '<div class="gallery-main" id="gMain">' +
-          '<img id="gImg" src="' + escA(imgs[0]) + '" alt="' + escA(nm) + '">' +
+          '<div class="gallery-track" id="gTrack">' +
+            imgs.map(function (u) {
+              return '<img src="' + escA(u) + '" alt="' + escA(nm) + '" draggable="false">';
+            }).join('') +
+          '</div>' +
           (badges ? '<div class="badges" style="top:auto;bottom:56px;left:12px">' + badges + '</div>' : '') +
+          (imgs.length > 1 ? '<button class="g-nav g-prev" id="gPrev" aria-label="prev">' +
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M15 18l-6-6 6-6"/></svg></button>' +
+            '<button class="g-nav g-next" id="gNext" aria-label="next">' +
+            '<svg width="20" height="20" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M9 6l6 6-6 6"/></svg></button>' +
+            '<span class="g-count" id="gCount"></span>' : '') +
           '<span class="zoom-hint">' + t('detail.zoom') + '</span>' +
         '</div>' +
         (imgs.length > 1 ? '<div class="thumbs" id="gThumbs">' + imgs.map(function (u, i) {
@@ -770,19 +826,61 @@
         '</div>' +
       '</div>';
 
-    var main = $('#gMain'), img = $('#gImg'), cur = 0;
-    main.onclick = function () { main.classList.toggle('is-zoom'); };
+    var main = $('#gMain'), track = $('#gTrack'), cur = 0;
     var thumbs = $('#gThumbs');
+    var gCount = $('#gCount'), gPrev = $('#gPrev'), gNext = $('#gNext');
+
+    main.onclick = function (e) {
+      if (e.target.closest('.g-nav')) return;   // 点箭头不算缩放
+      main.classList.toggle('is-zoom');
+    };
+
+    /* 把轨道滚到第 i 张（smooth），滚动事件里会自动同步计数器和缩略图 */
+    function goSlide(i) {
+      if (!track) return;
+      cur = Math.max(0, Math.min(imgs.length - 1, i));
+      track.scrollTo({ left: cur * track.clientWidth, behavior: 'smooth' });
+    }
+
+    function syncSlide() {
+      if (!track) return;
+      var w = Math.max(1, track.clientWidth);
+      var i = Math.round(track.scrollLeft / w);
+      if (i !== cur) cur = Math.max(0, Math.min(imgs.length - 1, i));
+      if (gCount) gCount.textContent = t('gallery.of', { a: cur + 1, b: imgs.length });
+      if (thumbs) $$('button', thumbs).forEach(function (x, idx) {
+        x.classList.toggle('is-active', idx === cur);
+      });
+      if (gPrev) gPrev.disabled = cur <= 0;
+      if (gNext) gNext.disabled = cur >= imgs.length - 1;
+    }
+
+    if (track) {
+      track.addEventListener('scroll', function () { requestAnimationFrame(syncSlide); }, { passive: true });
+      track.addEventListener('keydown', function () {}); // 防止滚动容器抢焦点后失灵
+      window.addEventListener('resize', function () {
+        track.scrollTo({ left: cur * track.clientWidth });
+      });
+    }
+    if (gPrev) gPrev.onclick = function () { main.classList.remove('is-zoom'); goSlide(cur - 1); };
+    if (gNext) gNext.onclick = function () { main.classList.remove('is-zoom'); goSlide(cur + 1); };
     if (thumbs) {
       thumbs.onclick = function (e) {
         var b = e.target.closest('button[data-i]');
         if (!b) return;
-        cur = Number(b.dataset.i);
-        img.src = imgs[cur];
         main.classList.remove('is-zoom');
-        $$('button', thumbs).forEach(function (x) { x.classList.toggle('is-active', x === b); });
+        goSlide(Number(b.dataset.i));
       };
     }
+    /* 键盘左右键翻图（弹窗打开时） */
+    galleryKeys = function (e) {
+      if ($('#modal').hidden) return;
+      if (e.key === 'ArrowLeft') goSlide(cur - 1);
+      else if (e.key === 'ArrowRight') goSlide(cur + 1);
+    };
+    document.addEventListener('keydown', galleryKeys);
+    syncSlide();
+    if (imgs.length > 1) syncSlide();  // 布局稳定后再同步一次宽度
     $$('[data-size]', $('#modalBody')).forEach(function (b) {
       b.onclick = function () {
         MODAL.size = b.dataset.size;
@@ -818,6 +916,7 @@
   function closeModal() {
     $('#modal').hidden = true;
     document.body.style.overflow = '';
+    if (galleryKeys) { document.removeEventListener('keydown', galleryKeys); galleryKeys = null; }
     if (location.hash.indexOf('#p=') === 0) {
       history.replaceState(null, '', location.pathname + location.search + (STATE.cat !== 'all' ? '#' + STATE.cat : ''));
     }
@@ -1007,7 +1106,11 @@
     onScroll();
     $('#toTop').onclick = function () { window.scrollTo({ top: 0, behavior: 'smooth' }); };
 
-    $('#moreBtn').onclick = function () { STATE.page++; renderGrid(); };
+    $('#pager').addEventListener('click', function (e) {
+      var b = e.target.closest('button[data-page]');
+      if (!b || b.disabled) return;
+      gotoPage(Number(b.dataset.page));
+    });
     window.addEventListener('hashchange', onHash);
   }
 

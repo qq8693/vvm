@@ -377,16 +377,54 @@ input, select, textarea { font: inherit; color: inherit; }
 .modal-close:hover { background: #fff; color: var(--ink); transform: rotate(90deg); }
 
 .gallery { flex: 0 0 50%; background: var(--bg-soft); display: flex; flex-direction: column; }
-.gallery-main { position: relative; flex: 1; min-height: 0; }
-.gallery-main img { width: 100%; height: 100%; object-fit: cover; }
+.gallery-main { position: relative; flex: 1; min-height: 0; overflow: hidden; }
+/* 滑动轨道：所有图横排，手机上直接左右划，桌面用箭头/缩略图 */
+.gallery-track {
+  display: flex; height: 100%;
+  overflow-x: auto; scroll-snap-type: x mandatory;
+  scrollbar-width: none; -ms-overflow-style: none;
+  -webkit-overflow-scrolling: touch;
+}
+.gallery-track::-webkit-scrollbar { display: none; }
+.gallery-track img {
+  flex: 0 0 100%; width: 100%; height: 100%;
+  object-fit: cover; scroll-snap-align: start; scroll-snap-stop: always;
+  user-select: none; -webkit-user-drag: none;
+}
+.gallery-main { cursor: zoom-in; }
+.gallery-main.is-zoom { cursor: zoom-out; }
+.gallery-main.is-zoom .gallery-track img { object-fit: contain; background: #fff; }
 .gallery-main .zoom-hint {
   position: absolute; bottom: 12px; left: 12px;
   font-size: 11px; color: var(--ink-3); background: rgba(255, 255, 255, .88);
   padding: 4px 10px; border-radius: var(--r-pill); backdrop-filter: blur(4px);
+  pointer-events: none;
 }
-.gallery-main img { cursor: zoom-in; }
-.gallery-main.is-zoom img { object-fit: contain; cursor: zoom-out; background: #fff; }
-.thumbs {
+/* 左右箭头（触屏上隐藏，直接划更顺手） */
+.g-nav {
+  position: absolute; top: 50%; transform: translateY(-50%);
+  width: 38px; height: 38px; border-radius: 50%;
+  border: 0; cursor: pointer; display: flex; align-items: center; justify-content: center;
+  background: rgba(255, 255, 255, .92); color: var(--ink);
+  box-shadow: var(--sh-2); backdrop-filter: blur(4px);
+  transition: background .2s, opacity .2s, transform .2s;
+  z-index: 2;
+}
+.g-nav:hover { background: #fff; transform: translateY(-50%) scale(1.06); }
+.g-nav:disabled { opacity: 0; pointer-events: none; }
+.g-prev { left: 12px; }
+.g-next { right: 12px; }
+/* 右上角「2 / 9」计数 */
+.g-count {
+  position: absolute; top: 12px; right: 12px; z-index: 2;
+  font-size: 11.5px; font-variant-numeric: tabular-nums;
+  color: var(--ink); background: rgba(255, 255, 255, .92);
+  padding: 4px 10px; border-radius: var(--r-pill); backdrop-filter: blur(4px);
+  pointer-events: none;
+}
+@media (hover: none) {
+  .g-nav { display: none; }
+}.thumbs {
   flex: 0 0 auto; display: flex; gap: 8px; padding: 12px;
   overflow-x: auto; scrollbar-width: thin;
 }
@@ -516,6 +554,30 @@ button.contact-row:hover { background: var(--bg-soft); }
 .to-top.is-on { opacity: 1; pointer-events: auto; }
 .to-top:hover { color: var(--ink); transform: translateY(-2px); }
 
+/* ------------------------------- 分页条 -------------------------------- */
+.pager {
+  display: flex; align-items: center; justify-content: center; flex-wrap: wrap;
+  gap: 6px; margin-top: 52px;
+}
+.pager button {
+  min-width: 38px; height: 38px; padding: 0 10px;
+  border: 1px solid var(--line); border-radius: var(--r-sm);
+  background: #fff; color: var(--ink-2); cursor: pointer;
+  font-size: 13.5px; font-variant-numeric: tabular-nums;
+  display: inline-flex; align-items: center; justify-content: center;
+  transition: border-color .2s, color .2s, background .2s;
+}
+.pager button:hover:not(:disabled) { border-color: var(--ink); color: var(--ink); }
+.pager button:disabled { opacity: .35; cursor: default; }
+.pager .pg-num.is-active {
+  background: var(--ink); border-color: var(--ink); color: #fff; font-weight: 600;
+}
+.pager .pg-dots { color: var(--ink-3); padding: 0 4px; user-select: none; }
+.pager .pg-info {
+  flex-basis: 100%; text-align: center; margin-top: 8px;
+  font-size: 12.5px; color: var(--ink-3);
+}
+
 /* ------------------------------- 响应式 -------------------------------- */
 @media (max-width: 1000px) {
   .hero { padding: 54px 0 46px; }
@@ -526,6 +588,8 @@ button.contact-row:hover { background: var(--bg-soft); }
   .gallery-main { aspect-ratio: 4 / 3; }
   .detail { padding: 26px 24px 28px; }
   .footer-grid { grid-template-columns: 1fr 1fr; gap: 34px; }
+  /* 手机上图廊在弹窗顶部，右上角是关闭按钮，计数器挪到右下角避让 */
+  .g-count { top: auto; bottom: 12px; right: 12px; }
 }
 
 @media (max-width: 720px) {
