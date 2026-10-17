@@ -27,9 +27,19 @@ if errorlevel 1 (
 
 echo.
 echo [2/3] 正在推送到 GitHub...
-git push origin main
-if errorlevel 1 goto fail
+set "TRY=0"
 
+:push
+set /a TRY+=1
+git push origin main
+if not errorlevel 1 goto pushed
+if %TRY% geq 3 goto fail
+echo.
+echo   推送失败（第 %TRY% 次），5 秒后自动重试...
+ping -n 6 127.0.0.1 >nul
+goto push
+
+:pushed
 echo.
 echo [3/3] 完成！
 echo.
@@ -42,7 +52,10 @@ goto end
 :fail
 echo.
 echo   !! 出错了，请看上面的提示。
-echo   常见原因：网络不通 / 还没登录 GitHub / 远程有新提交要先 pull。
+echo   常见原因：
+echo     - 网络不通或代理不稳（直接再双击运行一次通常就好了）
+echo     - 还没登录 GitHub
+echo     - 远程有新提交，需要先执行 git pull
 echo.
 
 :end
