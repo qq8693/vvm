@@ -874,7 +874,14 @@ def auto_translate(title, desc):
 
 # ---------------------------- 整店批量采集 --------------------------------
 STORE_URL_RE = re.compile(r'/weshop/store/([A-Za-z0-9_\-]{6,})', re.I)
-STORE_WORKERS = 6          # 同时抓几件（都是网络 IO，6 路比较稳）
+STORE_WORKERS = 4          # 同时抓几件（都是网络 IO；调低一点更像正常浏览）
+STORE_MAX_COUNT = 1000     # 一次最多采多少件
+STORE_ALL_LIMIT = 3000     # 「一直采到采完」的硬上限，防止死循环
+
+# 节奏控制：别把上家服务器打急了（打急了会被限流/封 IP）
+PACE_GAP = 0.35            # 每批之间歇一下（秒）
+PACE_EVERY = 40            # 每采这么多件，长歇一次
+PACE_REST = (3.0, 6.0)     # 长歇时长（随机区间，秒）
 
 # 批量任务状态，前端轮询这个
 STORE_JOB = {
@@ -952,13 +959,26 @@ def _store_json(op, url, referer, payload=None, timeout=45):
         h['Content-Type'] = 'application/json'
         req = urlreq.Request(url, data=json.dumps(payload).encode('utf-8'),
                              headers=h, method='POST')
-    raw = op.open(req, timeout=timeout).read()
+    try:
+        raw = op.open(req, timeout=timeout).read()
+    except Exception as e:
+        # 被限流时对方常直接返回 403 / 429 / 503
+        code = getattr(e, 'code', None)
+        if code in (403, 429, 503):
+            raise RuntimeError('对方开始限流了（HTTP %s），可能是采得太快' % code)
+        raise
     try:
         import gzip
         txt = gzip.decompress(raw).decode('utf-8', 'replace')
     except Exception:
         txt = raw.decode('utf-8', 'replace')
-    return json.loads(txt)
+    j = json.loads(txt)
+    # 接口层的限流：errcode 非 0 且提示里带「频繁/过快/稍后」
+    if isinstance(j, dict) and not j.get('success') and j.get('result') is None:
+        msg = str(j.get('errmsg') or j.get('message') or '')
+        if any(k in msg for k in ('频繁', '过快', '稍后', '限制', 'too many', 'rate')):
+            raise RuntimeError('对方提示操作太频繁：%s' % msg[:40])
+    return j
 
 
 def fetch_store_page(op, host, album_id, cursor=None, referer=None):
@@ -1115,6 +1135,17 @@ def _short_title(t, n=26):
     return t[:n] + ('…' if len(t) > n else '')
 
 
+def _wake_sleep(sec):
+    """睡一会儿，但点「停止」能立刻醒来（分段等，最多等 sec 秒）"""
+    if sec <= 0:
+        return
+    end = time.time() + sec
+    while time.time() < end:
+        if _STORE_STOP.is_set():
+            return
+        time.sleep(min(0.3, max(0.0, end - time.time())))
+
+
 def store_worker(cfg):
     """后台线程：整店批量采集"""
     import concurrent.futures
@@ -1125,8 +1156,11 @@ def store_worker(cfg):
              shopName='', shopTotal=0, current='', log=[], sizeText='',
              startedAt=time.strftime('%H:%M:%S'))
 
-        count = max(1, min(int(cfg.get('count') or 20), 200))
+        count = max(1, min(int(cfg.get('count') or 20), STORE_MAX_COUNT))
         skip = max(0, int(cfg.get('skip') or 0))
+        until_end = bool(cfg.get('untilEnd'))      # 一直采到店铺没有新商品为止
+        if until_end:
+            count = STORE_ALL_LIMIT                # 实际能采多少由列表决定，这里只是硬上限
         category = cfg.get('category') or ''
         use_tr = bool(cfg.get('translate'))
         skip_exist = bool(cfg.get('skipExisting'))
@@ -1141,16 +1175,22 @@ def store_worker(cfg):
         album_token = al.get('id') or ''
         total_all = al.get('totalItemCount') or 0
         _job(shopName=al.get('name') or '', shopTotal=total_all,
-             total=count, phase='读取商品列表…',
+             total=0 if until_end else count, phase='读取商品列表…',
              sizeText=human_size(os.path.getsize(DATA_FILE)))
         _job_log('店铺：%s（共 %s 件商品）'
                  % (al.get('name') or '未命名', total_all or '未知'))
+        if until_end:
+            _job_log('模式：一直采到店铺采完（最多 %d 件兜底）' % STORE_ALL_LIMIT)
+        else:
+            _job_log('模式：本次最多采 %d 件' % count)
         if use_price:
             _job_log('价格规则：上家价 <300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8（向上取整到整元）')
         else:
             _job_log('价格：不自动换算，留空之后自己在 admin.html 里填')
         _job_log('图片：不下载到本地，直接用上家图片链接（本地不占空间）')
         _job_log('文案：标题和描述里会自动删掉价格文字，客户看不到进价')
+        _job_log('节奏：每批之间歇 %.2fs，每 %d 件长歇 3–6s，不会把上家服务器打急'
+                 % (PACE_GAP, PACE_EVERY))
         if skip:
             _job_log('跳过前 %d 件（通常是店铺公告）' % skip)
 
@@ -1166,6 +1206,7 @@ def store_worker(cfg):
         page_no = 1
         walked = 0        # 走过的原始条目数（用于实现「跳过前 N 件」）
         dup = 0
+        pages_read = 0
         while len(pool) < count and (chunk or more) and not _STORE_STOP.is_set():
             for it in chunk:
                 walked += 1
@@ -1182,7 +1223,17 @@ def store_worker(cfg):
             if len(pool) >= count or not more:
                 break
             page_no += 1
-            _job(phase='读取第 %d 页商品…' % page_no)
+            pages_read += 1
+            if until_end:
+                # 一直采的模式：边翻页边采，别等列表全拉完（大店有几万件）
+                if pages_read <= 3 or pages_read % 10 == 0:
+                    _job_log('… 正在读取第 %d 页商品列表，已找到 %d 件待采' % (page_no, len(pool)))
+                if pages_read >= 30:
+                    break
+            else:
+                _job(phase='读取第 %d 页商品列表…' % page_no)
+            if PACE_GAP and not until_end:
+                time.sleep(PACE_GAP)
             pg = fetch_store_page(op, host, album_id, cursor, referer)
             chunk = pg['items']
             cursor, more = pg['cursor'], pg['more']
@@ -1209,6 +1260,8 @@ def store_worker(cfg):
                 auto_seq = max(auto_seq, int(m.group(1)))
 
         idx = 0
+        rest_boost = 0          # 被限流后自动拉长的休息时间（秒）
+        since_rest = 0          # 距上次长歇已经采了多少件
         while _job_get('added') < count and idx < len(pool) and not _STORE_STOP.is_set():
             batch = pool[idx:idx + STORE_WORKERS]
             idx += len(batch)
@@ -1222,6 +1275,18 @@ def store_worker(cfg):
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(STORE_WORKERS, len(batch))) as ex:
                 results = list(ex.map(one, batch))
+
+            # 被限流的迹象：这一批里几乎全失败，而且报错提到限流/失败
+            fails = sum(1 for r in results if 'fail' in r)
+            rate_limited = fails >= max(2, len(batch) - 1) and any(
+                any(k in str(r.get('fail', '')) for k in ('限流', '频繁', '太快'))
+                for r in results)
+            if rate_limited:
+                rest_boost = min(rest_boost + 20, 120)
+                _job_log('⚠ 看起来采得太快了，歇 %d 秒再继续（后面会更慢一点）' % rest_boost)
+                _wake_sleep(rest_boost + random.uniform(2, 5))
+            elif rest_boost:
+                rest_boost = max(0, rest_boost - 5)     # 没再限流就慢慢恢复速度
 
             for r in results:
                 if _STORE_STOP.is_set() or _job_get('added') >= count:
@@ -1269,12 +1334,30 @@ def store_worker(cfg):
                     _job_add('done')
                     _job_log('× 失败：%s' % r.get('fail', '未知原因'))
 
+            # 每批之间歇一下；每采若干件长歇一次，让请求节奏像正常浏览
+            if idx < len(pool) and not _STORE_STOP.is_set():
+                since_rest += len(batch)
+                if since_rest >= PACE_EVERY:
+                    since_rest = 0
+                    rest = random.uniform(*PACE_REST) + rest_boost
+                    _job_log('… 已采 %d 件，歇 %.1f 秒再继续' % (_job_get('added'), rest))
+                    _wake_sleep(rest)
+                else:
+                    _wake_sleep(PACE_GAP + rest_boost * 0.05)
+
         # ---- 3. 收尾 ----
         d['version'] = max(int(d.get('version') or 2), 3)
         write_data(d)
         size = os.path.getsize(DATA_FILE)
         added = _job_get('added')
-        if _job_get('added') < count and not _STORE_STOP.is_set():
+        if until_end and not _STORE_STOP.is_set():
+            if idx >= len(pool) and not more:
+                _job_log('已经采到店铺没有新商品了（共新增 %d 件）' % added)
+            elif added >= STORE_ALL_LIMIT:
+                _job_log('到了安全上限 %d 件，先停下来。再点一次可以接着采。' % STORE_ALL_LIMIT)
+            else:
+                _job_log('列表先读到这儿，这轮新增 %d 件。再点一次「开始」可以接着采。' % added)
+        elif added < count and not _STORE_STOP.is_set():
             _job_log('商品已经采完了（这次只采到 %d 件）' % added)
         _job(phase='完成', running=False, finished=True, current='',
              sizeText=human_size(size), total=added or count)
@@ -1478,12 +1561,17 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
       <p class="hint">按「最新发布」的顺序采集。上家店铺最上面通常有几张公告图（下单方式、尺码表之类），
         用「跳过前几件」可以绕开。</p>
       <div class="srow">
-        <div class="fgroup"><label>采集数量<span class="h">1–200</span></label>
-          <input class="inp" id="sCount" type="number" min="1" max="200" value="20"></div>
+        <div class="fgroup"><label>采集数量<span class="h">1–1000</span></label>
+          <input class="inp" id="sCount" type="number" min="1" max="1000" value="20"></div>
         <div class="fgroup"><label>跳过前几件<span class="h">公告图</span></label>
-          <input class="inp" id="sSkip" type="number" min="0" max="200" value="0"></div>
+          <input class="inp" id="sSkip" type="number" min="0" max="5000" value="0"></div>
         <div class="fgroup"><label>归到分类<span class="h">你网站的分类</span></label>
           <select class="inp" id="sCat"></select></div>
+      </div>
+
+      <label class="chk"><input type="checkbox" id="sUntilEnd"> 一直采到店铺采完（不用填数量，自动往下采）</label>
+      <div class="hint" style="margin:-4px 0 10px 26px">
+        大店铺可能有一两千件，会采很久。采过的商品会自动跳过，断了下一次接着采就行。
       </div>
 
       <label class="chk"><input type="checkbox" id="sSkipExist" checked> 跳过已经上架过的商品（避免重复）</label>
@@ -1495,7 +1583,8 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
 
       <div class="hint" style="margin:0 0 10px">
         · 图片：<b>不下载到本地</b>，直接用上家图片链接（本地不占空间，上传也快）。<br>
-        · 文案：标题和描述里的 <b>P125 / ¥299 / 300元 / 💰大号170 / 售价：399</b> 这类价格文字会自动删掉，客户看不到你的进价。
+        · 文案：标题和描述里的 <b>P125 / ¥299 / 300元 / 💰大号170 / 售价：399</b> 这类价格文字会自动删掉，客户看不到你的进价。<br>
+        · 节奏：采几件会歇几秒，被限流时自动放慢，避免被上家系统拦。
       </div>
 
       <div class="est" id="sEst">填好数量后，这里会显示预计耗时。</div>
@@ -1905,16 +1994,29 @@ function fmtSec(s){
 }
 
 function sEstimate(){
+  if ($('#sUntilEnd').checked){
+    $('#sEst').innerHTML = '会一直往下采，直到店铺没有新商品为止；'
+      + '每 ' + 40 + ' 件会歇 3–6 秒。<br>'
+      + '<span style="color:var(--ink3)">采过的会自动跳过，随时可以点停止，下次接着采。</span>';
+    return;
+  }
   var n = parseInt($('#sCount').value, 10) || 0;
   if (n <= 0) { $('#sEst').textContent = '填好数量后，这里会显示预计耗时。'; return; }
-  var sec = Math.max(4, Math.round(n * 0.7));
+  // 每件约 0.9 秒（4 路并发抓详情），外加每 40 件长歇一次
+  var sec = Math.max(4, Math.round(n * 0.9 + Math.floor(n / 40) * 4.5));
   var html = '预计 <b>' + n + '</b> 件，用时约 <b>' + fmtSec(sec) + '</b>；'
     + '图片不下载，本地只增加几 KB 文字。';
-  if (n > 100) html += '<br><span style="color:var(--dan)">数量较多，建议分几次采。</span>';
+  if (n > 300) html += '<br><span style="color:var(--dan)">数量较多，建议分几次采，或者勾上「一直采到店铺采完」慢慢跑。</span>';
   $('#sEst').innerHTML = html;
 }
 $('#sCount').oninput = sEstimate;
 $('#sCount').onchange = sEstimate;
+$('#sUntilEnd').onchange = function(){
+  var on = this.checked;
+  $('#sCount').disabled = on;
+  $('#sCount').style.opacity = on ? .45 : 1;
+  sEstimate();
+};
 
 $('#sCheck').onclick = function(){
   var u = $('#sUrl').value.trim();
@@ -1952,14 +2054,19 @@ $('#sUrl').addEventListener('keydown', function(e){
 $('#sGo').onclick = function(){
   var u = $('#sUrl').value.trim();
   if (!u) { showErr($('#sErr'), '请先粘贴店铺链接'); $('#sUrl').focus(); return; }
+  var untilEnd = $('#sUntilEnd').checked;
   var n = parseInt($('#sCount').value, 10);
-  if (!(n >= 1 && n <= 200)) { showErr($('#sErr'), '采集数量请填 1–200 之间的数字'); $('#sCount').focus(); return; }
+  if (!untilEnd && !(n >= 1 && n <= 1000)) {
+    showErr($('#sErr'), '采集数量请填 1–1000 之间的数字，或勾上「一直采到店铺采完」');
+    $('#sCount').focus(); return;
+  }
   showErr($('#sErr'), '');
   var b = $('#sGo');
   b.disabled = true; b.textContent = '正在启动…';
   api('/api/store/start', {
     url: u,
-    count: n,
+    count: untilEnd ? 1000 : n,
+    untilEnd: untilEnd,
     skip: parseInt($('#sSkip').value, 10) || 0,
     category: $('#sCat').value,
     skipExisting: $('#sSkipExist').checked,
@@ -2223,6 +2330,7 @@ class Handler(BaseHTTPRequestHandler):
                 'skipExisting': b.get('skipExisting'),
                 'allowEmptyTitle': b.get('allowEmptyTitle'),
                 'usePrice': b.get('usePrice'),
+                'untilEnd': b.get('untilEnd'),
                 'maxSide': b.get('maxSide'),
             })
             return self._json({'ok': True})
