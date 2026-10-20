@@ -130,7 +130,8 @@ PRICE_WORDS = ('拿货价|进货价|批发价|代理价|成本价|开单价|售�
 RE_PRICE_WORD = re.compile(
     r'(?:%s)\s*[:：]?\s*[¥￥]?\s*(\d{1,6}(?:\.\d{1,2})?)' % PRICE_WORDS)
 RE_PRICE_CUR = re.compile(r'[¥￥]\s*(\d{1,6}(?:\.\d{1,2})?)')
-RE_PRICE_YUAN = re.compile(r'(\d{1,6}(?:\.\d{1,2})?)\s*(?:元|块钱?)')
+RE_PRICE_YUAN = re.compile(
+    r'(\d{1,6}(?:\.\d{1,2})?)\s*(?:元|块钱?)(?![优惠券红包运费邮费])')
 RE_PRICE_EMOJI = re.compile(
     r'[💰💵💴💶💷]\s*[¥￥]?[^\d\n]{0,3}?(\d{1,6}(?:\.\d{1,2})?)')
 # 首行的「P125 / p145 / P 120」这种编号，是上家最常用的标价写法
@@ -239,6 +240,79 @@ def extract_price(c, title):
     if v:
         return {'value': _tidy(v), 'from': why}
     return {'value': None, 'from': ''}
+
+
+# ---------- 清掉文案里的价格痕迹（不能让客户看到进价） ----------
+# 上家习惯把拿货价写在文案里：P125、¥299、300元、💰大号170、售价：399 …
+# 这些必须从标题和描述里删干净，products.js 是公开文件，客户能看到源码。
+RE_CLEAN_WORD = re.compile(
+    r'(?:拿货价|进货价|批发价|代理价|成本价|开单价|售价|价格|一口价|单价|现价|特价|活动价|到手价)'
+    r'\s*[:：]?\s*[¥￥]?\s*\d{1,6}(?:\.\d{1,2})?\s*(?:元|块钱?)?')
+RE_CLEAN_CUR = re.compile(
+    r'(?:RMB|rmb|Rmb)\s*\d{1,6}(?:\.\d{1,2})?|[¥￥]\s*\d{1,6}(?:\.\d{1,2})?')
+RE_CLEAN_EMOJI = re.compile(
+    r'[💰💵💴💶💷]\s*[¥￥]?[^\d\n]{0,3}?\d{1,6}(?:\.\d{1,2})?\s*(?:元|块钱?)?[。，,、;；]?')
+RE_CLEAN_SIZE = re.compile(
+    r'(?:大号|中号|小号|大码|中码|小码|特大)\s*[:：]?\s*[¥￥]?'
+    r'(\d{2,6}(?:\.\d{1,2})?)\s*(?:元|块钱?)?'
+    r'(?!\s*(?:[*×xX]|cm|CM|mm|厘米|公分|寸))')   # 后面跟尺寸符号的，是「大号36*12*23」不是价格
+RE_CLEAN_YUAN = re.compile(
+    r'(?<![0-9.])\d{1,6}(?:\.\d{1,2})?\s*(?:元|块钱?)(?![优惠券红包运费邮费])')
+RE_CLEAN_PCODE = re.compile(
+    r'(?im)(?:^[ \t\u3000]*|[ \t\u3000]+)[Pp][ \t]?\d{2,5}(?=[ \t\u3000]|[。，,、;；:：]|$)')
+
+# 首行常常是「礼盒包装 / 尺寸：…」这类规格说明，不是商品名，取下一行当标题
+SPEC_WORDS = ('礼盒', '包装', '盒子', '飞机盒', '带盒', '礼袋', '防尘袋', '尺寸', '尺码表',
+              '规格', 'size', '升级版', '芯片版')
+# 删掉价格后只剩这些词的整行，没意义，直接丢掉
+LEFTOVER_ONLY = {'包邮', '不包邮', '起', '以上', '以下', '左右', '元', '块', '块钱',
+                 '即可', '优惠', '特价', '现货', '。', '.', '，', ','}
+
+
+def strip_price_text(text):
+    """删掉文案里的价格痕迹，返回 (清理后的文字, 删掉的处数)"""
+    if not text:
+        return '', 0
+    raw = str(text)
+    t = raw.replace('\u200b', '').replace('\ufeff', '')
+    hits = 0
+    for rx in (RE_CLEAN_WORD, RE_CLEAN_CUR, RE_CLEAN_EMOJI,
+               RE_CLEAN_SIZE, RE_CLEAN_YUAN, RE_CLEAN_PCODE):
+        t, k = rx.subn('', t)
+        hits += k
+    if not hits:
+        return raw.strip(), 0
+
+    lines = []
+    for ln in t.split('\n'):
+        was_empty = not ln.strip()
+        s = re.sub(r'[ \t\u3000]{2,}', ' ', ln).strip()
+        s = re.sub(r'^[。，,、;；:：\-—·\s]+', '', s)
+        s = re.sub(r'[，,、;；:：\s]+$', '', s).strip()
+        if s and s not in LEFTOVER_ONLY:
+            lines.append(s)
+        elif was_empty:
+            lines.append('')          # 本来就是空行，保留段落间隔
+    return re.sub(r'\n{3,}', '\n\n', '\n'.join(lines)).strip('\n'), hits
+
+
+def pick_name_line(lines):
+    """挑一行当商品标题：跳过「礼盒包装 / size：…」这类规格行，取第一行真正像商品名的"""
+    lines = [l.strip() for l in (lines or []) if l and l.strip()]
+    if not lines:
+        return ''
+
+    def is_spec(s):
+        low = s.lower()
+        return len(s) <= 6 or any(w in low for w in SPEC_WORDS)
+
+    cand = [l for l in lines[:4] if not is_spec(l)]
+    for l in cand:
+        if len(l) >= 8:                  # 第一条像样的商品名
+            return l[:60]
+    if cand:
+        return max(cand, key=len)[:60]
+    return lines[0][:60]
 
 
 # --------------------------- 数据文件读写 ---------------------------------
@@ -382,10 +456,10 @@ def fetch_product(page_url):
         imgs = [re.sub(r'\?.*$', '', u) for u in (c.get('imgs') or []) if u]
     tags = [t.get('tagName') for t in (c.get('tags') or []) if t.get('tagName')]
 
-    lines = [l.strip() for l in title.split('\n') if l.strip()]
-    first = lines[0] if lines else ''
-
     pr = extract_price(c, title)
+    clean_title, removed = strip_price_text(title)
+    lines = [l.strip() for l in clean_title.split('\n') if l.strip()]
+    first = pick_name_line(lines)
     suggest, div = markup_price(pr['value']) if pr['value'] else (None, None)
 
     return {
@@ -394,16 +468,17 @@ def fetch_product(page_url):
         'itemId': item,
         'pageUrl': page,
         'shopName': c.get('shop_name') or '',
-        'titleFull': title,
+        'titleFull': clean_title,
         'titleFirst': first,
         'images': imgs,
         'tags': tags,
         'publishTime': c.get('time') or '',
-        'sizesGuess': guess_sizes(title),
+        'sizesGuess': guess_sizes(clean_title),
         'sourcePrice': pr['value'],
         'priceFrom': pr['from'],
         'suggestPrice': suggest,
         'priceRule': price_rule_text(pr['value'], suggest, div) if suggest else '',
+        'priceRemoved': removed,
     }
 
 
@@ -934,20 +1009,25 @@ def _store_detail(op, host, album_token, item_id, referer):
     if not imgs:
         imgs = [re.sub(r'\?.*$', '', u) for u in (c.get('imgs') or []) if u]
     tags = [t.get('tagName') for t in (c.get('tags') or []) if t.get('tagName')]
-    lines = [l.strip() for l in title.split('\n') if l.strip()]
+    raw = title
+    clean_title, removed = strip_price_text(raw)
+    lines = [l.strip() for l in clean_title.split('\n') if l.strip()]
     return {
-        'titleFull': title,
-        'titleFirst': lines[0] if lines else '',
+        'titleFull': clean_title,
+        'titleFirst': pick_name_line(lines),
         'images': imgs,
         'tags': tags,
         'shopName': c.get('shop_name') or '',
-        'price': extract_price(c, title),
+        'price': extract_price(c, raw),
+        'removed': removed,
     }
 
 
 def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
-               allow_empty=False, use_price=True):
-    """处理一件商品：详情 → 下图 → 翻译 → 组装成 products.js 里的对象。
+               allow_empty=False, use_price=True, download=False):
+    """处理一件商品：详情 → （可选）下图 → 翻译 → 组装成 products.js 里的对象。
+
+    download=False 时图片不落地，直接用上家图片链接（省空间）。
 
     返回 {'prod': {...}} / {'skip': '原因'} / {'fail': '原因'}，不抛异常。
     """
@@ -968,9 +1048,14 @@ def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
     if not det['images']:
         return {'skip': '没有图片'}
 
-    saved, failed = download_images(det['images'], item_id, max_side, ci_quality(max_side))
-    if not saved:
-        return {'fail': '图片全部下载失败'}
+    if download:
+        saved, failed = download_images(det['images'], item_id, max_side, ci_quality(max_side))
+        if not saved:
+            return {'fail': '图片全部下载失败'}
+    else:
+        # 不下载，只把上家链接换成「压缩到 900px」的版本，客户打开更快，本地不占空间
+        saved = [add_ci_params(u, max_side, ci_quality(max_side)) for u in det['images']]
+        failed = []
 
     name = ''
     if title:
@@ -1009,9 +1094,10 @@ def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
         'order': 0,
         'createdAt': time.strftime('%Y-%m-%d'),
         'sourceUrl': '%s/weshop/product/%s/%s' % (host, album_token, item_id),
-        'sourcePrice': src_price,
     }, 'title': name, 'imgs': len(saved), 'autoName': auto_name,
-        'price': price, 'sourcePrice': src_price, 'rule': price_rule_text(src_price, price, div)}
+        'price': price, 'sourcePrice': src_price,
+        'rule': price_rule_text(src_price, price, div),
+        'removed': det.get('removed', 0), 'download': download}
 
 
 def _existing_item_ids(d):
@@ -1035,7 +1121,7 @@ def store_worker(cfg):
 
     try:
         _job(running=True, finished=False, phase='连接店铺…', error='',
-             total=0, done=0, added=0, skipped=0, failed=0, priced=0,
+             total=0, done=0, added=0, skipped=0, failed=0, priced=0, cleaned=0,
              shopName='', shopTotal=0, current='', log=[], sizeText='',
              startedAt=time.strftime('%H:%M:%S'))
 
@@ -1063,6 +1149,8 @@ def store_worker(cfg):
             _job_log('价格规则：上家价 <300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8（向上取整到整元）')
         else:
             _job_log('价格：不自动换算，留空之后自己在 admin.html 里填')
+        _job_log('图片：不下载到本地，直接用上家图片链接（本地不占空间）')
+        _job_log('文案：标题和描述里会自动删掉价格文字，客户看不到进价')
         if skip:
             _job_log('跳过前 %d 件（通常是店铺公告）' % skip)
 
@@ -1126,8 +1214,10 @@ def store_worker(cfg):
             idx += len(batch)
 
             def one(it):
+                # 整店采集一律不下载图片，直接用上家链接（省空间）
                 return _store_one(op, host, album_token, it, referer,
-                                  max_side, use_tr, category, allow_empty, use_price)
+                                  max_side, use_tr, category, allow_empty,
+                                  use_price, False)
 
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(STORE_WORKERS, len(batch))) as ex:
@@ -1162,6 +1252,8 @@ def store_worker(cfg):
                     if r.get('price'):
                         _job_add('priced')
                         pnote = '　¥%s ← %s' % (fmt_money(r['price']), r.get('rule') or '')
+                    if r.get('removed'):
+                        _job_add('cleaned', r['removed'])
                     _job_log('✓ %s（%d 张图）%s' % (_short_title(ttl), r['imgs'], pnote))
                     try:
                         write_data(d)
@@ -1187,8 +1279,11 @@ def store_worker(cfg):
         _job(phase='完成', running=False, finished=True, current='',
              sizeText=human_size(size), total=added or count)
         priced = _job_get('priced')
+        cleaned = _job_get('cleaned')
         _job_log('结束：新增 %d 件（其中 %d 件按规则填好了售价），跳过 %d 件，失败 %d 件'
                  % (added, priced, _job_get('skipped'), _job_get('failed')))
+        if cleaned:
+            _job_log('顺手删掉了 %d 处价格文字，客户看不到你的进价。' % cleaned)
         if added and priced < added:
             _job_log('剩下 %d 件上家没标价格，去 admin.html 里手动填就行。' % (added - priced))
 
@@ -1398,7 +1493,12 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
       <div class="hint" style="margin:-4px 0 12px 26px">规则：上家价 <b>&lt;300</b> 时 ÷0.6 ｜ <b>300–700</b> 时 ÷0.7 ｜ <b>≥700</b> 时 ÷0.8，结果向上取整到整元。<br>
         上家没标价格的那几件留空，网站上显示「面议」，之后在 admin.html 里补。</div>
 
-      <div class="est" id="sEst">填好数量后，这里会显示预计耗时和占用空间。</div>
+      <div class="hint" style="margin:0 0 10px">
+        · 图片：<b>不下载到本地</b>，直接用上家图片链接（本地不占空间，上传也快）。<br>
+        · 文案：标题和描述里的 <b>P125 / ¥299 / 300元 / 💰大号170 / 售价：399</b> 这类价格文字会自动删掉，客户看不到你的进价。
+      </div>
+
+      <div class="est" id="sEst">填好数量后，这里会显示预计耗时。</div>
 
       <button class="btn big ok" id="sGo" style="width:100%">开始批量采集</button>
       <div id="sErr"></div>
@@ -1627,13 +1727,16 @@ $('#fDesc').addEventListener('input', function(){ if (!enTouched) scheduleTransl
 function showPriceNote(d){
   var el = $('#priceNote');
   if (!el) return;
+  var cleaned = (d && d.priceRemoved)
+    ? '　<span style="color:var(--dan)">文案里的价格文字已删掉 ' + d.priceRemoved + ' 处，客户看不到进价。</span>'
+    : '';
   if (d && d.sourcePrice){
     el.innerHTML = '上家标价 <b>¥' + esc(d.sourcePrice) + '</b>'
       + (d.priceFrom ? '（' + esc(d.priceFrom) + '）' : '')
-      + ' → ' + esc(d.priceRule || '') + '　<span style="color:var(--ink3)">售价已经填好，可以改。</span>';
+      + ' → ' + esc(d.priceRule || '') + '　<span style="color:var(--ink3)">售价已经填好，可以改。</span>' + cleaned;
   } else {
     el.innerHTML = '上家这件<b>没标价格</b>，售价自己填（留空网站上显示「面议」）。'
-      + '参考规则：&lt;300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8';
+      + '参考规则：&lt;300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8' + cleaned;
   }
 }
 $('#fPrice').addEventListener('input', function(){
@@ -1743,7 +1846,6 @@ $('#save').onclick = function(){
     descriptionEn: $('#fDescEn').value,
     price: $('#fPrice').value,
     originalPrice: $('#fOrig').value,
-    sourcePrice: S.scraped.sourcePrice == null ? '' : S.scraped.sourcePrice,
     unit: $('#fUnit').value.trim(),
     category: $('#fCat').value,
     sizes: $('#fSizes').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean),
@@ -1804,12 +1906,11 @@ function fmtSec(s){
 
 function sEstimate(){
   var n = parseInt($('#sCount').value, 10) || 0;
-  if (n <= 0) { $('#sEst').textContent = '填好数量后，这里会显示预计耗时和占用空间。'; return; }
-  var mb = n * 0.9;
-  var sec = Math.max(5, Math.round(n * 1.3));
-  var html = '预计 <b>' + n + '</b> 件，用时约 <b>' + fmtSec(sec) + '</b>，'
-    + '图片约 <b>' + mb.toFixed(0) + ' MB</b>。';
-  if (n > 100) html += '<br><span style="color:var(--dan)">数量较多，采集和上传都会比较慢，建议分几次采。</span>';
+  if (n <= 0) { $('#sEst').textContent = '填好数量后，这里会显示预计耗时。'; return; }
+  var sec = Math.max(4, Math.round(n * 0.7));
+  var html = '预计 <b>' + n + '</b> 件，用时约 <b>' + fmtSec(sec) + '</b>；'
+    + '图片不下载，本地只增加几 KB 文字。';
+  if (n > 100) html += '<br><span style="color:var(--dan)">数量较多，建议分几次采。</span>';
   $('#sEst').innerHTML = html;
 }
 $('#sCount').oninput = sEstimate;
@@ -2152,6 +2253,13 @@ class Handler(BaseHTTPRequestHandler):
         title = (b.get('title') or '').strip()
         if not title:
             return self._json({'ok': False, 'error': '标题不能为空'})
+        # 兜底：万一文案里还留着价格痕迹，写盘前再清一遍（products.js 是公开文件）
+        title, n1 = strip_price_text(title)
+        desc, n2 = strip_price_text(b.get('description') or '')
+        if n1 or n2:
+            log('  写入前又清掉 %d 处价格文字' % (n1 + n2))
+        if not title:
+            return self._json({'ok': False, 'error': '标题在删掉价格文字后变空了，请自己写一个'})
         images = [u for u in (b.get('images') or []) if u]
         if not images:
             return self._json({'ok': False, 'error': '至少要留一张图片'})
@@ -2197,9 +2305,6 @@ class Handler(BaseHTTPRequestHandler):
         orig = num(b.get('originalPrice'))
         if orig is not None and orig == int(orig):
             orig = int(orig)
-        src_price = num(b.get('sourcePrice'))
-        if src_price is not None and src_price == int(src_price):
-            src_price = int(src_price)
 
         cat = b.get('category') or ''
         cat_ids = [c.get('id') for c in d.get('categories', [])]
@@ -2216,7 +2321,7 @@ class Handler(BaseHTTPRequestHandler):
             'unit': (b.get('unit') or '').strip(),
             'unitEn': '',
             'images': images,
-            'description': (b.get('description') or '').strip(),
+            'description': desc,
             'descriptionEn': (b.get('descriptionEn') or '').strip(),
             'sizes': [s for s in (b.get('sizes') or []) if s],
             'sizesEn': [],
@@ -2231,7 +2336,6 @@ class Handler(BaseHTTPRequestHandler):
             'order': len(d.get('products', [])) + 1,
             'createdAt': time.strftime('%Y-%m-%d'),
             'sourceUrl': src.get('pageUrl') or '',
-            'sourcePrice': src_price,
         }
 
         d.setdefault('products', []).append(prod)
