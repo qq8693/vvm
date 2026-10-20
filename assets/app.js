@@ -1133,7 +1133,12 @@
   function onHash() {
     var h = decodeURIComponent((location.hash || '').replace(/^#/, ''));
     if (h.indexOf('p=') === 0) { openDetail(h.slice(2)); return; }
-    if (h) applyCat(h);
+    if (!h) return;
+    if (h === 'all') { applyCat('all'); return; }
+    /* 只有真实存在的分类 id 才切换过滤；#products、#contact 这类
+       页面锚点只负责滚动定位，绝不能当成分类（否则清单会变空） */
+    var isCat = STATE.data.categories.some(function (x) { return x.id === h; });
+    if (isCat) applyCat(h);
   }
 
   /* ============================== 启动 ================================== */
