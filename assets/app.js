@@ -1051,7 +1051,7 @@
 
       var card = e.target.closest('.card');
       if (card) { openDetail(card.dataset.id); return; }
-      if (e.target.closest('#contactBtn') || e.target.closest('#footContactBtn')) { openContact(''); }
+      if (e.target.closest('#contactBtn') || e.target.closest('#contactBtn2') || e.target.closest('#footContactBtn')) { openContact(''); }
     });
 
     $('#chips').addEventListener('click', function (e) {
