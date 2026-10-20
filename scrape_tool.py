@@ -13,6 +13,7 @@
 """
 import base64
 import json
+import math
 import os
 import random
 import re
@@ -70,6 +71,174 @@ def human_size(n):
     if n >= 1024:
         return '%.1f KB' % (n / 1024.0)
     return '%d B' % n
+
+
+# ------------------------- 提价规则（上家价 → 我的售价） -------------------
+# 上家给的是拿货价。我的售价 = 拿货价 ÷ 系数（系数越小加价越多）。
+PRICE_TIERS = (
+    (300, 0.6),      # 低于 300 元
+    (700, 0.7),      # 300 ~ 700 元
+    (None, 0.8),     # 700 元及以上
+)
+
+
+def fmt_money(v):
+    """125.0 -> '125'；125.5 -> '125.5'"""
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return str(v)
+    return ('%.2f' % f).rstrip('0').rstrip('.')
+
+
+def price_divisor(src):
+    """按上家价落在哪一档，返回对应系数"""
+    for limit, div in PRICE_TIERS:
+        if limit is None or src < limit:
+            return div
+    return PRICE_TIERS[-1][1]
+
+
+def markup_price(src):
+    """上家价 -> 我的售价。返回 (售价, 系数)；价格无效时 (None, None)。
+
+    售价向上取整到整元：宁可多一块，也不少一块。
+    """
+    try:
+        src = float(src)
+    except (TypeError, ValueError):
+        return None, None
+    if src <= 0:
+        return None, None
+    div = price_divisor(src)
+    p = int(math.ceil(src / div - 1e-9))
+    return p, div
+
+
+def price_rule_text(src, price=None, div=None):
+    """给人看的换算说明，例如「上家 ¥125 ÷ 0.6 = ¥209」"""
+    if price is None or div is None:
+        price, div = markup_price(src)
+    if price is None:
+        return ''
+    return '上家 ¥%s ÷ %s = ¥%s' % (fmt_money(src), fmt_money(div), fmt_money(price))
+
+
+# 文案里可能出现的价格写法，按可信度从高到低
+PRICE_WORDS = ('拿货价|进货价|批发价|代理价|成本价|开单价|售价|价格|一口价|'
+               '单价|现价|特价|活动价|到手价')
+RE_PRICE_WORD = re.compile(
+    r'(?:%s)\s*[:：]?\s*[¥￥]?\s*(\d{1,6}(?:\.\d{1,2})?)' % PRICE_WORDS)
+RE_PRICE_CUR = re.compile(r'[¥￥]\s*(\d{1,6}(?:\.\d{1,2})?)')
+RE_PRICE_YUAN = re.compile(r'(\d{1,6}(?:\.\d{1,2})?)\s*(?:元|块钱?)')
+RE_PRICE_EMOJI = re.compile(
+    r'[💰💵💴💶💷]\s*[¥￥]?[^\d\n]{0,3}?(\d{1,6}(?:\.\d{1,2})?)')
+# 首行的「P125 / p145 / P 120」这种编号，是上家最常用的标价写法
+RE_PRICE_PCODE = re.compile(r'(?m)^[ \t\u3000]*[Pp]\s?(\d{2,5})(?=\s|$|[。，,、;；:：）)]|[\u4e00-\u9fa5])')
+
+_PRICE_MIN = 5          # 低于 5 元的「价格」基本是误判
+_PRICE_MAX = 100000
+
+
+def _num_ok(v):
+    return _PRICE_MIN <= v <= _PRICE_MAX
+
+
+def parse_price_text(text):
+    """从商品文案里找上家标的价格。返回 (价格, 依据说明)；找不到返回 (None, '')。"""
+    if not text:
+        return None, ''
+    text = str(text).replace('\u200b', '').replace('\ufeff', '')
+
+    def grab(rx, kind):
+        out = []
+        for m in rx.finditer(text):
+            try:
+                v = float(m.group(1))
+            except (TypeError, ValueError):
+                continue
+            if _num_ok(v):
+                out.append((v, kind))
+        return out
+
+    # 依次尝试：明确写了「价格/售价…」的 > 带 ¥ 的 > 「xx 元」的 > 💰 > 首行 P 编号
+    for rx, kind in ((RE_PRICE_WORD, 'words'), (RE_PRICE_CUR, 'cur'),
+                     (RE_PRICE_YUAN, 'yuan')):
+        hits = grab(rx, kind)
+        if hits:
+            return hits[0][0], _KIND_TEXT[kind]
+
+    hits = grab(RE_PRICE_EMOJI, 'emoji')
+    if hits:
+        # 「💰大号170 💰中号165 💰小号160」这种，取最高的那个价
+        return max(h[0] for h in hits), _KIND_TEXT['emoji']
+
+    hits = grab(RE_PRICE_PCODE, 'pcode')
+    if hits:
+        return hits[0][0], _KIND_TEXT['pcode']
+    return None, ''
+
+
+_KIND_TEXT = {
+    'words': '文案里写的价格',
+    'cur': '文案里的 ¥ 标价',
+    'yuan': '文案里的「元」标价',
+    'emoji': '文案里的 💰 标价',
+    'pcode': '标题开头的编号',
+}
+
+
+def _api_price(c):
+    """从接口字段里取上家价（optimaPrice 最常见）"""
+    for k in ('optimaPrice', 'itemPrice', 'excludeActivityOptimalPrice',
+              'excludeActivityPublicOptimalPrice', 'salePrice', 'unitPrice', 'price'):
+        v = c.get(k)
+        if isinstance(v, (int, float)) or (isinstance(v, str) and v.strip()):
+            try:
+                f = float(str(v).replace('¥', '').replace('￥', '').strip())
+            except ValueError:
+                continue
+            if _num_ok(f):
+                return f
+    # 多规格价：skuPriceMap / sku.price 里取最低（页面上也是「¥xx 起」）
+    cands = []
+    m = c.get('skuPriceMap') or {}
+    if isinstance(m, dict):
+        for v in m.values():
+            try:
+                f = float(str(v))
+            except (TypeError, ValueError):
+                continue
+            if _num_ok(f):
+                cands.append(f)
+    sku = c.get('sku') or {}
+    if isinstance(sku, dict):
+        try:
+            f = float(str(sku.get('price')))
+            if _num_ok(f):
+                cands.append(f)
+        except (TypeError, ValueError):
+            pass
+    return min(cands) if cands else None
+
+
+def _tidy(v):
+    """125.0 -> 125；125.5 保持 125.5"""
+    try:
+        return int(v) if float(v) == int(float(v)) else round(float(v), 2)
+    except (TypeError, ValueError):
+        return v
+
+
+def extract_price(c, title):
+    """上家价：先看接口字段，再看文案。返回 {'value': x, 'from': '接口'|'文案…'}"""
+    v = _api_price(c)
+    if v:
+        return {'value': _tidy(v), 'from': '接口标价'}
+    v, why = parse_price_text(title)
+    if v:
+        return {'value': _tidy(v), 'from': why}
+    return {'value': None, 'from': ''}
 
 
 # --------------------------- 数据文件读写 ---------------------------------
@@ -216,6 +385,9 @@ def fetch_product(page_url):
     lines = [l.strip() for l in title.split('\n') if l.strip()]
     first = lines[0] if lines else ''
 
+    pr = extract_price(c, title)
+    suggest, div = markup_price(pr['value']) if pr['value'] else (None, None)
+
     return {
         'host': host,
         'albumId': album,
@@ -228,6 +400,10 @@ def fetch_product(page_url):
         'tags': tags,
         'publishTime': c.get('time') or '',
         'sizesGuess': guess_sizes(title),
+        'sourcePrice': pr['value'],
+        'priceFrom': pr['from'],
+        'suggestPrice': suggest,
+        'priceRule': price_rule_text(pr['value'], suggest, div) if suggest else '',
     }
 
 
@@ -765,11 +941,12 @@ def _store_detail(op, host, album_token, item_id, referer):
         'images': imgs,
         'tags': tags,
         'shopName': c.get('shop_name') or '',
+        'price': extract_price(c, title),
     }
 
 
 def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
-               allow_empty=False):
+               allow_empty=False, use_price=True):
     """处理一件商品：详情 → 下图 → 翻译 → 组装成 products.js 里的对象。
 
     返回 {'prod': {...}} / {'skip': '原因'} / {'fail': '原因'}，不抛异常。
@@ -803,12 +980,16 @@ def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
         tr = auto_translate(name, title)
         name_en, desc_en = tr['title'], tr['desc']
 
+    # 上家标了价就按提价规则算好售价；没标就留空（网站显示「面议」）
+    src_price = det.get('price', {}).get('value') if use_price else None
+    price, div = markup_price(src_price) if src_price else (None, None)
+
     return {'prod': {
         'id': new_id(),
         'name': name,
         'nameEn': name_en,
         'category': category,
-        'price': None,
+        'price': price,
         'originalPrice': None,
         'unit': '',
         'unitEn': '',
@@ -828,7 +1009,9 @@ def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
         'order': 0,
         'createdAt': time.strftime('%Y-%m-%d'),
         'sourceUrl': '%s/weshop/product/%s/%s' % (host, album_token, item_id),
-    }, 'title': name, 'imgs': len(saved), 'autoName': auto_name}
+        'sourcePrice': src_price,
+    }, 'title': name, 'imgs': len(saved), 'autoName': auto_name,
+        'price': price, 'sourcePrice': src_price, 'rule': price_rule_text(src_price, price, div)}
 
 
 def _existing_item_ids(d):
@@ -852,7 +1035,7 @@ def store_worker(cfg):
 
     try:
         _job(running=True, finished=False, phase='连接店铺…', error='',
-             total=0, done=0, added=0, skipped=0, failed=0,
+             total=0, done=0, added=0, skipped=0, failed=0, priced=0,
              shopName='', shopTotal=0, current='', log=[], sizeText='',
              startedAt=time.strftime('%H:%M:%S'))
 
@@ -862,6 +1045,7 @@ def store_worker(cfg):
         use_tr = bool(cfg.get('translate'))
         skip_exist = bool(cfg.get('skipExisting'))
         allow_empty = bool(cfg.get('allowEmptyTitle'))
+        use_price = cfg.get('usePrice', True) is not False
         max_side = int(cfg.get('maxSide') or 900)
 
         host, album_id = parse_store_url(cfg.get('url'))
@@ -875,6 +1059,10 @@ def store_worker(cfg):
              sizeText=human_size(os.path.getsize(DATA_FILE)))
         _job_log('店铺：%s（共 %s 件商品）'
                  % (al.get('name') or '未命名', total_all or '未知'))
+        if use_price:
+            _job_log('价格规则：上家价 <300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8（向上取整到整元）')
+        else:
+            _job_log('价格：不自动换算，留空之后自己在 admin.html 里填')
         if skip:
             _job_log('跳过前 %d 件（通常是店铺公告）' % skip)
 
@@ -939,7 +1127,7 @@ def store_worker(cfg):
 
             def one(it):
                 return _store_one(op, host, album_token, it, referer,
-                                  max_side, use_tr, category, allow_empty)
+                                  max_side, use_tr, category, allow_empty, use_price)
 
             with concurrent.futures.ThreadPoolExecutor(
                     max_workers=min(STORE_WORKERS, len(batch))) as ex:
@@ -970,7 +1158,11 @@ def store_worker(cfg):
                     _job_add('done')
                     ttl = r['prod'].get('name') or '（无标题）'
                     _job(current=_short_title(ttl))
-                    _job_log('✓ %s（%d 张图）' % (_short_title(ttl), r['imgs']))
+                    pnote = ''
+                    if r.get('price'):
+                        _job_add('priced')
+                        pnote = '　¥%s ← %s' % (fmt_money(r['price']), r.get('rule') or '')
+                    _job_log('✓ %s（%d 张图）%s' % (_short_title(ttl), r['imgs'], pnote))
                     try:
                         write_data(d)
                         _job(sizeText=human_size(os.path.getsize(DATA_FILE)))
@@ -994,8 +1186,11 @@ def store_worker(cfg):
             _job_log('商品已经采完了（这次只采到 %d 件）' % added)
         _job(phase='完成', running=False, finished=True, current='',
              sizeText=human_size(size), total=added or count)
-        _job_log('结束：新增 %d 件，跳过 %d 件，失败 %d 件'
-                 % (added, _job_get('skipped'), _job_get('failed')))
+        priced = _job_get('priced')
+        _job_log('结束：新增 %d 件（其中 %d 件按规则填好了售价），跳过 %d 件，失败 %d 件'
+                 % (added, priced, _job_get('skipped'), _job_get('failed')))
+        if added and priced < added:
+            _job_log('剩下 %d 件上家没标价格，去 admin.html 里手动填就行。' % (added - priced))
 
     except Exception as e:
         _job(phase='出错', running=False, finished=True,
@@ -1199,6 +1394,9 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
       <label class="chk"><input type="checkbox" id="sSkipExist" checked> 跳过已经上架过的商品（避免重复）</label>
       <label class="chk"><input type="checkbox" id="sTranslate" checked> 采集时自动翻译成英文</label>
       <label class="chk"><input type="checkbox" id="sEmpty" checked> 上家没写文字的商品也采（标题自动编成「新品 01」，可再改）</label>
+      <label class="chk"><input type="checkbox" id="sUsePrice" checked> 采到价格就按提价规则算好售价</label>
+      <div class="hint" style="margin:-4px 0 12px 26px">规则：上家价 <b>&lt;300</b> 时 ÷0.6 ｜ <b>300–700</b> 时 ÷0.7 ｜ <b>≥700</b> 时 ÷0.8，结果向上取整到整元。<br>
+        上家没标价格的那几件留空，网站上显示「面议」，之后在 admin.html 里补。</div>
 
       <div class="est" id="sEst">填好数量后，这里会显示预计耗时和占用空间。</div>
 
@@ -1237,7 +1435,7 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
 
       <div class="card">
         <h3>3. 补充信息</h3>
-        <p class="hint">采集到的文字已经在下面了，改一改就行。价格必须自己填。</p>
+        <p class="hint">采集到的文字已经在下面了，改一改就行。上家标了价格的话，售价会按提价规则自动算好。</p>
         <div id="err2"></div>
 
         <div class="fgroup"><label>标题 <b>*</b><span class="h">客户看到的名字</span></label>
@@ -1251,6 +1449,7 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
           <div class="fgroup"><label>原价</label><input class="inp" id="fOrig" type="number" step="0.01" placeholder="划线价"></div>
           <div class="fgroup"><label>单位</label><input class="inp" id="fUnit" placeholder="件/双/个"></div>
         </div>
+        <div class="hint" id="priceNote" style="margin:-6px 0 14px"></div>
 
         <div class="fgroup"><label>品类</label><select class="inp" id="fCat"></select></div>
 
@@ -1298,7 +1497,7 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
   <div class="card" style="margin-top:16px">
     <h3>使用小抄</h3>
     <p class="hint" style="margin-bottom:8px">· 每次采集完点一次「写入 products.js」，可以连续采很多个，最后一起上传 GitHub。</p>
-    <p class="hint" style="margin-bottom:8px">· 采集只拿得到<b>图片和文字</b>，价格必须自己填（上家不公开价格）。</p>
+    <p class="hint" style="margin-bottom:8px">· 上家商品<b>标了价格</b>的，会按你的提价规则自动算好售价（&lt;300 ÷0.6、300–700 ÷0.7、≥700 ÷0.8）；<b>没标价</b>的留空，去 admin.html 补。</p>
     <p class="hint" style="margin-bottom:12px">· 想把采集来的商品改一改、删掉、调顺序，之后再打开 <kbd>admin.html</kbd> 就行，两边数据是同一个文件。</p>
     <div id="compactBox" style="border-top:1px solid var(--line);padding-top:14px">
       <div class="fgroup" style="margin-bottom:8px">
@@ -1424,12 +1623,37 @@ $('#fDescEn').addEventListener('input', function(){ enTouched = true; });
 $('#fName').addEventListener('input', function(){ if (!enTouched) scheduleTranslate(); });
 $('#fDesc').addEventListener('input', function(){ if (!enTouched) scheduleTranslate(); });
 
+/* 价格提示：上家标价 → 按提价规则算出的售价 */
+function showPriceNote(d){
+  var el = $('#priceNote');
+  if (!el) return;
+  if (d && d.sourcePrice){
+    el.innerHTML = '上家标价 <b>¥' + esc(d.sourcePrice) + '</b>'
+      + (d.priceFrom ? '（' + esc(d.priceFrom) + '）' : '')
+      + ' → ' + esc(d.priceRule || '') + '　<span style="color:var(--ink3)">售价已经填好，可以改。</span>';
+  } else {
+    el.innerHTML = '上家这件<b>没标价格</b>，售价自己填（留空网站上显示「面议」）。'
+      + '参考规则：&lt;300 ÷0.6 ｜ 300–700 ÷0.7 ｜ ≥700 ÷0.8';
+  }
+}
+$('#fPrice').addEventListener('input', function(){
+  if (!S.scraped) return;
+  var v = $('#fPrice').value;
+  if (S.scraped.sourcePrice && String(v) !== String(S.scraped.suggestPrice)){
+    $('#priceNote').innerHTML = '已手动改成 ¥' + esc(v || '0') + '，不再套用提价规则。';
+  } else if (S.scraped.sourcePrice){
+    showPriceNote(S.scraped);
+  }
+});
+
 function fillForm(d){
   enTouched = false;
   $('#fName').value = d.titleFirst || '';
   $('#fDesc').value = d.titleFull || '';
   autoTranslate();
-  $('#fPrice').value = ''; $('#fOrig').value = ''; $('#fUnit').value = '';
+  $('#fPrice').value = (d.suggestPrice == null ? '' : d.suggestPrice);
+  $('#fOrig').value = ''; $('#fUnit').value = '';
+  showPriceNote(d);
   $('#fSizes').value = (d.sizesGuess || []).join(',');
   $('#fTags').value = '';
   showErr($('#err2'), '');
@@ -1519,6 +1743,7 @@ $('#save').onclick = function(){
     descriptionEn: $('#fDescEn').value,
     price: $('#fPrice').value,
     originalPrice: $('#fOrig').value,
+    sourcePrice: S.scraped.sourcePrice == null ? '' : S.scraped.sourcePrice,
     unit: $('#fUnit').value.trim(),
     category: $('#fCat').value,
     sizes: $('#fSizes').value.split(',').map(function(x){ return x.trim(); }).filter(Boolean),
@@ -1639,6 +1864,7 @@ $('#sGo').onclick = function(){
     skipExisting: $('#sSkipExist').checked,
     translate: $('#sTranslate').checked,
     allowEmptyTitle: $('#sEmpty').checked,
+    usePrice: $('#sUsePrice').checked,
     maxSide: 900
   }).then(function(j){
     if (!j.ok) {
@@ -1682,6 +1908,7 @@ function renderStore(job){
   $('#sStat').innerHTML =
     '<span>进度 <b>' + done + ' / ' + total + '</b></span>'
     + '<span class="ok">新增 <b>' + (job.added || 0) + '</b></span>'
+    + (job.priced ? '<span>已定价 <b>' + job.priced + '</b></span>' : '')
     + '<span class="sk">跳过 <b>' + (job.skipped || 0) + '</b></span>'
     + '<span class="no">失败 <b>' + (job.failed || 0) + '</b></span>'
     + (job.sizeText ? '<span>数据文件 <b>' + esc(job.sizeText) + '</b></span>' : '');
@@ -1894,6 +2121,7 @@ class Handler(BaseHTTPRequestHandler):
                 'translate': b.get('translate'),
                 'skipExisting': b.get('skipExisting'),
                 'allowEmptyTitle': b.get('allowEmptyTitle'),
+                'usePrice': b.get('usePrice'),
                 'maxSide': b.get('maxSide'),
             })
             return self._json({'ok': True})
@@ -1969,6 +2197,9 @@ class Handler(BaseHTTPRequestHandler):
         orig = num(b.get('originalPrice'))
         if orig is not None and orig == int(orig):
             orig = int(orig)
+        src_price = num(b.get('sourcePrice'))
+        if src_price is not None and src_price == int(src_price):
+            src_price = int(src_price)
 
         cat = b.get('category') or ''
         cat_ids = [c.get('id') for c in d.get('categories', [])]
@@ -2000,6 +2231,7 @@ class Handler(BaseHTTPRequestHandler):
             'order': len(d.get('products', [])) + 1,
             'createdAt': time.strftime('%Y-%m-%d'),
             'sourceUrl': src.get('pageUrl') or '',
+            'sourcePrice': src_price,
         }
 
         d.setdefault('products', []).append(prod)
