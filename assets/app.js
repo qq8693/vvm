@@ -1088,7 +1088,14 @@
       renderGrid();
     };
 
-    $('#menuBtn').onclick = function () { $('#nav').classList.toggle('is-open'); };
+    $('#menuBtn').onclick = function () {
+      var nav = $('#nav');
+      nav.classList.toggle('is-open');
+      if (nav.classList.contains('is-open')) {
+        // 手机菜单是固定定位的，公告条会让页头变高，展开时对齐到页头底部
+        nav.style.top = document.querySelector('.site-header').getBoundingClientRect().bottom + 'px';
+      }
+    };
 
     $('#modalBg').onclick = closeModal;
     $('#modalClose').onclick = closeModal;
