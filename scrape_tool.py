@@ -621,6 +621,398 @@ def auto_translate(title, desc):
     }
 
 
+# ---------------------------- 整店批量采集 --------------------------------
+STORE_URL_RE = re.compile(r'/weshop/store/([A-Za-z0-9_\-]{6,})', re.I)
+STORE_WORKERS = 6          # 同时抓几件（都是网络 IO，6 路比较稳）
+
+# 批量任务状态，前端轮询这个
+STORE_JOB = {
+    'running': False, 'finished': False, 'phase': '',
+    'total': 0, 'done': 0, 'added': 0, 'skipped': 0, 'failed': 0,
+    'shopName': '', 'shopTotal': 0, 'current': '', 'error': '',
+    'log': [], 'sizeText': '', 'startedAt': '',
+}
+_STORE_LOCK = threading.Lock()
+_STORE_STOP = threading.Event()
+
+
+def _job(**kw):
+    with _STORE_LOCK:
+        STORE_JOB.update(kw)
+
+
+def _job_add(key, n=1):
+    with _STORE_LOCK:
+        STORE_JOB[key] = int(STORE_JOB.get(key) or 0) + n
+        return STORE_JOB[key]
+
+
+def _job_get(key):
+    with _STORE_LOCK:
+        return STORE_JOB.get(key)
+
+
+def _job_log(line):
+    with _STORE_LOCK:
+        STORE_JOB['log'].append(line)
+        if len(STORE_JOB['log']) > 80:
+            STORE_JOB['log'] = STORE_JOB['log'][-80:]
+
+
+def parse_store_url(u):
+    """从店铺链接里解析出 (host, albumId)"""
+    u = (u or '').strip()
+    if not u:
+        raise ValueError('请先粘贴店铺链接')
+    if not re.match(r'^https?://', u, re.I):
+        u = 'https://' + u
+    p = urlparse.urlparse(u)
+    if not p.netloc:
+        raise ValueError('这个链接看起来不完整，请复制店铺首页的完整链接')
+    host = '%s://%s' % (p.scheme, p.netloc)
+    m = STORE_URL_RE.search(p.path or '')
+    if m:
+        return host, m.group(1)
+    q = urlparse.parse_qs(p.query or '')
+    for k in ('albumId', 'shopId', 'targetAlbumId'):
+        if q.get(k):
+            return host, q[k][0]
+    raise ValueError('没能从链接里找到店铺编号。\n'
+                     '请打开店铺首页，复制地址栏里的完整链接（通常形如 '
+                     '/weshop/store/一串编号）。')
+
+
+def _open_store(host, album_id):
+    """新建一个带游客 cookie 的会话，并先访问店铺页拿到 token"""
+    import http.cookiejar
+    cj = http.cookiejar.CookieJar()
+    op = urlreq.build_opener(urlreq.HTTPCookieProcessor(cj))
+    page = '%s/weshop/store/%s' % (host, album_id)
+    op.open(urlreq.Request(page, headers={'User-Agent': UA}), timeout=45).read()
+    return op, page
+
+
+def _store_json(op, url, referer, payload=None, timeout=45):
+    h = {'User-Agent': UA, 'Accept': 'application/json, text/plain, */*',
+         'Referer': referer}
+    if payload is None:
+        req = urlreq.Request(url, headers=h)
+    else:
+        h['Content-Type'] = 'application/json'
+        req = urlreq.Request(url, data=json.dumps(payload).encode('utf-8'),
+                             headers=h, method='POST')
+    raw = op.open(req, timeout=timeout).read()
+    try:
+        import gzip
+        txt = gzip.decompress(raw).decode('utf-8', 'replace')
+    except Exception:
+        txt = raw.decode('utf-8', 'replace')
+    return json.loads(txt)
+
+
+def fetch_store_page(op, host, album_id, cursor=None, referer=None):
+    """拉店铺商品列表的一页（游标分页）"""
+    q = 'albumId=%s&startDate=&endDate=&auditPassword=' % urlparse.quote(album_id)
+    if cursor:
+        q += '&slipType=1&timestamp=%s' % cursor
+    q += '&requestDataType='
+    url = '%s/album/personal/all?&%s' % (host, q)
+    j = _store_json(op, url, referer or host, {})
+    res = j.get('result') or {}
+    pg = res.get('pagination') or {}
+    return {
+        'items': res.get('items') or [],
+        'cursor': pg.get('pageTimestamp'),
+        'more': bool(pg.get('isLoadMore')),
+        'album': res.get('targetAlbum') or {},
+    }
+
+
+def fetch_store_info(store_url):
+    """读店铺基本信息（店名、商品总数），用来确认链接没粘错"""
+    host, album_id = parse_store_url(store_url)
+    op, referer = _open_store(host, album_id)
+    page = fetch_store_page(op, host, album_id, referer=referer)
+    al = page['album']
+    return {
+        'host': host,
+        'albumId': album_id,
+        'shopName': al.get('name') or '',
+        'total': al.get('totalItemCount') or 0,
+        'albumToken': al.get('id') or '',
+        'desc': (al.get('desc') or '').strip(),
+        'firstPage': len(page['items']),
+    }
+
+
+def _store_detail(op, host, album_token, item_id, referer):
+    """取单件商品的完整标题和多张原图"""
+    url = ('%s/commodity/view?targetAlbumId=%s&itemId=%s&transLang=zh&auditPassword='
+           % (host, album_token, item_id))
+    j = _store_json(op, url, referer, timeout=30)
+    if not j.get('success'):
+        raise RuntimeError(j.get('errmsg') or '详情接口返回失败')
+    c = (j.get('result') or {}).get('commodity') or {}
+    title = (c.get('title') or '').strip()
+    imgs = [u for u in (c.get('imgsSrc') or []) if u]
+    if not imgs:
+        imgs = [re.sub(r'\?.*$', '', u) for u in (c.get('imgs') or []) if u]
+    tags = [t.get('tagName') for t in (c.get('tags') or []) if t.get('tagName')]
+    lines = [l.strip() for l in title.split('\n') if l.strip()]
+    return {
+        'titleFull': title,
+        'titleFirst': lines[0] if lines else '',
+        'images': imgs,
+        'tags': tags,
+        'shopName': c.get('shop_name') or '',
+    }
+
+
+def _store_one(op, host, album_token, item, referer, max_side, use_tr, category,
+               allow_empty=False):
+    """处理一件商品：详情 → 下图 → 翻译 → 组装成 products.js 里的对象。
+
+    返回 {'prod': {...}} / {'skip': '原因'} / {'fail': '原因'}，不抛异常。
+    """
+    item_id = item.get('goods_id') or item.get('selfGoodsId') or ''
+    if not item_id:
+        return {'skip': '没有商品编号'}
+    try:
+        det = _store_detail(op, host, album_token, item_id, referer)
+    except Exception as e:
+        return {'fail': '详情读取失败（%s）' % str(e)[:60]}
+
+    title = det['titleFull']
+    auto_name = False
+    if not title:
+        if not allow_empty:
+            return {'skip': '没有文字描述'}
+        auto_name = True                      # 只有图片，标题交给主线程编号
+    if not det['images']:
+        return {'skip': '没有图片'}
+
+    saved, failed = download_images(det['images'], item_id, max_side, ci_quality(max_side))
+    if not saved:
+        return {'fail': '图片全部下载失败'}
+
+    name = ''
+    if title:
+        name = det['titleFirst'] or title.split('\n')[0][:40]
+    name_en = desc_en = ''
+    if use_tr and title:
+        tr = auto_translate(name, title)
+        name_en, desc_en = tr['title'], tr['desc']
+
+    return {'prod': {
+        'id': new_id(),
+        'name': name,
+        'nameEn': name_en,
+        'category': category,
+        'price': None,
+        'originalPrice': None,
+        'unit': '',
+        'unitEn': '',
+        'images': saved,
+        'description': title,
+        'descriptionEn': desc_en,
+        'sizes': guess_sizes(title),
+        'sizesEn': [],
+        'colors': [],
+        'specs': [],
+        'tags': det['tags'][:2],
+        'tagsEn': [],
+        'stock': None,
+        'soldOut': False,
+        'hidden': False,
+        'featured': False,
+        'order': 0,
+        'createdAt': time.strftime('%Y-%m-%d'),
+        'sourceUrl': '%s/weshop/product/%s/%s' % (host, album_token, item_id),
+    }, 'title': name, 'imgs': len(saved), 'autoName': auto_name}
+
+
+def _existing_item_ids(d):
+    """已上架商品的来源 id 集合，用来跳过重复采集"""
+    ids = set()
+    for p in d.get('products', []):
+        u = (p.get('sourceUrl') or '').rstrip('/')
+        if u:
+            ids.add(u.rsplit('/', 1)[-1])
+    return ids
+
+
+def _short_title(t, n=26):
+    t = (t or '').replace('\n', ' ').strip()
+    return t[:n] + ('…' if len(t) > n else '')
+
+
+def store_worker(cfg):
+    """后台线程：整店批量采集"""
+    import concurrent.futures
+
+    try:
+        _job(running=True, finished=False, phase='连接店铺…', error='',
+             total=0, done=0, added=0, skipped=0, failed=0,
+             shopName='', shopTotal=0, current='', log=[], sizeText='',
+             startedAt=time.strftime('%H:%M:%S'))
+
+        count = max(1, min(int(cfg.get('count') or 20), 200))
+        skip = max(0, int(cfg.get('skip') or 0))
+        category = cfg.get('category') or ''
+        use_tr = bool(cfg.get('translate'))
+        skip_exist = bool(cfg.get('skipExisting'))
+        allow_empty = bool(cfg.get('allowEmptyTitle'))
+        max_side = int(cfg.get('maxSide') or 900)
+
+        host, album_id = parse_store_url(cfg.get('url'))
+        op, referer = _open_store(host, album_id)
+        first = fetch_store_page(op, host, album_id, referer=referer)
+        al = first['album']
+        album_token = al.get('id') or ''
+        total_all = al.get('totalItemCount') or 0
+        _job(shopName=al.get('name') or '', shopTotal=total_all,
+             total=count, phase='读取商品列表…',
+             sizeText=human_size(os.path.getsize(DATA_FILE)))
+        _job_log('店铺：%s（共 %s 件商品）'
+                 % (al.get('name') or '未命名', total_all or '未知'))
+        if skip:
+            _job_log('跳过前 %d 件（通常是店铺公告）' % skip)
+
+        # ---- 1. 预取商品列表：跳过头条公告 + 过滤已采过的 ----
+        d = read_data()
+        exist = _existing_item_ids(d) if skip_exist else set()
+        if exist:
+            _job_log('本地已有 %d 件商品，重复的会自动跳过' % len(exist))
+
+        pool = []
+        chunk = list(first['items'])
+        cursor, more = first['cursor'], first['more']
+        page_no = 1
+        walked = 0        # 走过的原始条目数（用于实现「跳过前 N 件」）
+        dup = 0
+        while len(pool) < count and (chunk or more) and not _STORE_STOP.is_set():
+            for it in chunk:
+                walked += 1
+                if walked <= skip:
+                    continue
+                iid = it.get('goods_id') or it.get('selfGoodsId') or ''
+                if skip_exist and iid in exist:
+                    dup += 1
+                    continue
+                pool.append(it)
+                if len(pool) >= count:
+                    break
+            chunk = []
+            if len(pool) >= count or not more:
+                break
+            page_no += 1
+            _job(phase='读取第 %d 页商品…' % page_no)
+            pg = fetch_store_page(op, host, album_id, cursor, referer)
+            chunk = pg['items']
+            cursor, more = pg['cursor'], pg['more']
+
+        if dup:
+            _job_log('列表里有 %d 件已经采过，直接跳过（不重复下载图片）' % dup)
+            _job_add('skipped', dup)
+        if not pool:
+            raise RuntimeError('没有读到新商品。可能这个店铺的商品都已经采过了，'
+                               '或者「跳过前几件」填太大了。')
+        if len(pool) < count:
+            _job(total=len(pool))
+            _job_log('这个店铺能采的新商品只有 %d 件' % len(pool))
+
+        # ---- 2. 逐批并发采集 ----
+        backup_data()
+        _job(phase='开始采集…')
+
+        # 自动编号要接着已有的「新品 NN」往后排，避免重名
+        auto_seq = 0
+        for p in d.get('products', []):
+            m = re.match(r'^新品 (\d+)$', p.get('name') or '')
+            if m:
+                auto_seq = max(auto_seq, int(m.group(1)))
+
+        idx = 0
+        while _job_get('added') < count and idx < len(pool) and not _STORE_STOP.is_set():
+            batch = pool[idx:idx + STORE_WORKERS]
+            idx += len(batch)
+
+            def one(it):
+                return _store_one(op, host, album_token, it, referer,
+                                  max_side, use_tr, category, allow_empty)
+
+            with concurrent.futures.ThreadPoolExecutor(
+                    max_workers=min(STORE_WORKERS, len(batch))) as ex:
+                results = list(ex.map(one, batch))
+
+            for r in results:
+                if _STORE_STOP.is_set() or _job_get('added') >= count:
+                    break
+                item_id = ''
+                if 'prod' in r:
+                    su = r['prod'].get('sourceUrl') or ''
+                    item_id = su.rsplit('/', 1)[-1]
+                    if item_id in exist:
+                        _job_add('skipped')
+                        _job_add('done')
+                        _job_log('– 已存在，跳过：%s' % _short_title(r.get('title') or '（无标题）'))
+                        continue
+                    if r.get('autoName'):
+                        auto_seq += 1
+                        r['prod']['name'] = '新品 %02d' % auto_seq
+                        if use_tr:
+                            r['prod']['nameEn'] = 'New item %02d' % auto_seq
+                        _job_log('· 这件没有文字，标题先用「新品 %02d」，之后可改' % auto_seq)
+                    r['prod']['order'] = len(d['products']) + 1
+                    d['products'].append(r['prod'])
+                    exist.add(item_id)
+                    _job_add('added')
+                    _job_add('done')
+                    ttl = r['prod'].get('name') or '（无标题）'
+                    _job(current=_short_title(ttl))
+                    _job_log('✓ %s（%d 张图）' % (_short_title(ttl), r['imgs']))
+                    try:
+                        write_data(d)
+                        _job(sizeText=human_size(os.path.getsize(DATA_FILE)))
+                    except Exception as e:
+                        _job_log('! 写文件失败：%s' % e)
+                elif 'skip' in r:
+                    _job_add('skipped')
+                    _job_add('done')
+                    _job_log('– 跳过（%s）' % r['skip'])
+                else:
+                    _job_add('failed')
+                    _job_add('done')
+                    _job_log('× 失败：%s' % r.get('fail', '未知原因'))
+
+        # ---- 3. 收尾 ----
+        d['version'] = max(int(d.get('version') or 2), 3)
+        write_data(d)
+        size = os.path.getsize(DATA_FILE)
+        added = _job_get('added')
+        if _job_get('added') < count and not _STORE_STOP.is_set():
+            _job_log('商品已经采完了（这次只采到 %d 件）' % added)
+        _job(phase='完成', running=False, finished=True, current='',
+             sizeText=human_size(size), total=added or count)
+        _job_log('结束：新增 %d 件，跳过 %d 件，失败 %d 件'
+                 % (added, _job_get('skipped'), _job_get('failed')))
+
+    except Exception as e:
+        _job(phase='出错', running=False, finished=True,
+             error='%s: %s' % (type(e).__name__, e))
+        _job_log('× ' + str(e))
+
+
+def start_store_job(cfg):
+    with _STORE_LOCK:
+        if STORE_JOB.get('running'):
+            raise RuntimeError('已经有一个采集任务在跑了，请等它结束或先点停止。')
+    _STORE_STOP.clear()
+    t = threading.Thread(target=store_worker, args=(cfg,), daemon=True)
+    t.start()
+    return True
+
+
 # ------------------------------ 网页界面 ----------------------------------
 PAGE = r"""<!doctype html>
 <html lang="zh-CN"><head><meta charset="utf-8">
@@ -723,6 +1115,34 @@ textarea.inp{resize:vertical;line-height:1.65}
   animation:sp .7s linear infinite}
 kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px;border-radius:5px;
   padding:1px 6px;font-size:11.5px;font-family:inherit}
+/* ---- 整店批量采集 ---- */
+.tabs{display:inline-flex;gap:4px;background:var(--line2);border-radius:9px;padding:4px;margin-bottom:16px}
+.tab{font-size:13.5px;padding:6px 18px;border-radius:7px;color:var(--ink2);transition:background .15s}
+.tab:hover{color:var(--ink)}
+.tab.is-on{background:#fff;color:var(--ink);box-shadow:var(--sh);font-weight:500}
+.srow{display:grid;grid-template-columns:1fr 1fr 1.3fr;gap:12px}
+@media(max-width:640px){.srow{grid-template-columns:1fr}}
+.chk{display:flex;align-items:center;gap:8px;font-size:13px;color:var(--ink2);margin:9px 0;cursor:pointer}
+.chk input{width:15px;height:15px;accent-color:var(--pri);margin:0}
+.est{font-size:12.5px;color:var(--ink3);background:var(--line2);border-radius:8px;
+  padding:9px 12px;margin:14px 0 12px;line-height:1.7}
+.est b{color:var(--ink2);font-weight:600}
+.sinfo{display:none;margin-top:14px;font-size:13px;background:#f2f7ff;border:1px solid #cfe0ff;
+  border-radius:8px;padding:11px 13px;line-height:1.7}
+.sinfo.on{display:block}
+.sinfo .nm{font-weight:600}
+.sinfo .tag{display:inline-block;font-size:11.5px;background:#fff;border:1px solid #cfe0ff;
+  border-radius:99px;padding:1px 9px;margin:4px 5px 0 0;color:var(--ink2)}
+.pbar{height:8px;background:var(--line2);border-radius:99px;overflow:hidden;margin:12px 0 10px}
+.pbar i{display:block;height:100%;background:var(--pri);border-radius:99px;transition:width .35s}
+.pstat{display:flex;gap:16px;flex-wrap:wrap;font-size:12.5px;color:var(--ink2)}
+.pstat b{font-weight:600;color:var(--ink)}
+.pstat .ok{color:var(--ok)}
+.pstat .sk{color:var(--warn)}
+.pstat .no{color:var(--dan)}
+.plog{font-size:12px;line-height:1.8;color:var(--ink2);background:#fbfcfd;border:1px solid var(--line);
+  border-radius:8px;padding:10px 12px;margin-top:12px;max-height:240px;overflow:auto;
+  white-space:pre-wrap;font-family:ui-monospace,Menlo,Consolas,monospace}
 </style></head>
 <body>
 <header><div class="wrap hd">
@@ -735,14 +1155,66 @@ kbd{background:var(--line2);border:1px solid var(--line);border-bottom-width:2px
 <div class="wrap main">
 
   <div class="card">
-    <h3>1. 粘贴商品链接</h3>
-    <p class="hint">在上家店铺里打开某个商品，复制浏览器地址栏的链接（通常长这样：
-      …wgstores.com/weshop/product/<span style="color:var(--ink3)">一串编号</span>/<span style="color:var(--ink3)">一串编号</span>）</p>
-    <div class="urlrow">
-      <input class="inp" id="url" placeholder="把商品链接粘贴到这里，然后点右边「开始采集」" spellcheck="false">
-      <button class="btn" id="go">开始采集</button>
+    <div class="tabs">
+      <button class="tab is-on" data-tab="one">单个商品</button>
+      <button class="tab" data-tab="store">整个店铺</button>
     </div>
-    <div id="err1"></div>
+
+    <div id="tabOne">
+      <h3>1. 粘贴商品链接</h3>
+      <p class="hint">在上家店铺里打开某个商品，复制浏览器地址栏的链接（通常长这样：
+        …wgstores.com/weshop/product/<span style="color:var(--ink3)">一串编号</span>/<span style="color:var(--ink3)">一串编号</span>）</p>
+      <div class="urlrow">
+        <input class="inp" id="url" placeholder="把商品链接粘贴到这里，然后点右边「开始采集」" spellcheck="false">
+        <button class="btn" id="go">开始采集</button>
+      </div>
+      <div id="err1"></div>
+    </div>
+
+    <div id="tabStore" hidden>
+      <h3>1. 粘贴店铺链接</h3>
+      <p class="hint">打开上家的店铺首页，复制地址栏链接（形如
+        …wecatalog.cn/weshop/store/<span style="color:var(--ink3)">一串编号</span>）。
+        会先读出店名和商品总数，确认没粘错再开始。</p>
+      <div class="urlrow">
+        <input class="inp" id="sUrl" placeholder="把店铺首页链接粘贴到这里" spellcheck="false">
+        <button class="btn ghost" id="sCheck">读取店铺</button>
+      </div>
+      <div class="sinfo" id="sInfo"></div>
+
+      <hr style="border:0;border-top:1px solid var(--line);margin:18px 0 16px">
+
+      <h3>2. 采集设置</h3>
+      <p class="hint">按「最新发布」的顺序采集。上家店铺最上面通常有几张公告图（下单方式、尺码表之类），
+        用「跳过前几件」可以绕开。</p>
+      <div class="srow">
+        <div class="fgroup"><label>采集数量<span class="h">1–200</span></label>
+          <input class="inp" id="sCount" type="number" min="1" max="200" value="20"></div>
+        <div class="fgroup"><label>跳过前几件<span class="h">公告图</span></label>
+          <input class="inp" id="sSkip" type="number" min="0" max="200" value="0"></div>
+        <div class="fgroup"><label>归到分类<span class="h">你网站的分类</span></label>
+          <select class="inp" id="sCat"></select></div>
+      </div>
+
+      <label class="chk"><input type="checkbox" id="sSkipExist" checked> 跳过已经上架过的商品（避免重复）</label>
+      <label class="chk"><input type="checkbox" id="sTranslate" checked> 采集时自动翻译成英文</label>
+      <label class="chk"><input type="checkbox" id="sEmpty" checked> 上家没写文字的商品也采（标题自动编成「新品 01」，可再改）</label>
+
+      <div class="est" id="sEst">填好数量后，这里会显示预计耗时和占用空间。</div>
+
+      <button class="btn big ok" id="sGo" style="width:100%">开始批量采集</button>
+      <div id="sErr"></div>
+    </div>
+  </div>
+
+  <div id="storeRun" class="card" hidden>
+    <h3>3. 采集进度 <span id="sPhase" style="font-size:12.5px;color:var(--ink3);font-weight:400"></span></h3>
+    <div class="pbar"><i id="sBar" style="width:0%"></i></div>
+    <div class="pstat" id="sStat"></div>
+    <div class="plog" id="sLog"></div>
+    <div style="margin-top:14px">
+      <button class="btn ghost" id="sStop">停止采集</button>
+    </div>
   </div>
 
   <div id="loading" class="card" hidden>
@@ -908,11 +1380,13 @@ function refreshStat(){  api('/api/state').then(function(j){
         + '点这个按钮可以把所有内嵌图片抽出来存到 images/ 文件夹，数据文件瞬间变小。转换前会自动备份。';
     $('#compactBox').style.display = j.embedded ? 'block' : 'none';
     S.cats = j.categories || [];
-    var sel = $('#fCat'), cur = sel.value;
-    sel.innerHTML = '<option value="">未分类</option>' + S.cats.map(function(c){
+    var html = '<option value="">未分类</option>' + S.cats.map(function(c){
       return '<option value="'+esc(c.id)+'">'+esc(c.name)+(c.nameEn&&c.nameEn!==c.name?' / '+esc(c.nameEn):'')+'</option>';
     }).join('');
+    var sel = $('#fCat'), cur = sel.value;
+    sel.innerHTML = html;
     if (cur) sel.value = cur;
+    var sel2 = $('#sCat'); if (sel2) { var cur2 = sel2.value; sel2.innerHTML = html; if (cur2) sel2.value = cur2; }
   });
 }
 
@@ -1086,6 +1560,148 @@ $('#compact').onclick = function(){
   });
 };
 
+/* ---------- 整店批量采集 ---------- */
+var STORE = { timer: null, job: null };
+
+Array.prototype.forEach.call(document.querySelectorAll('.tab'), function(b){
+  b.onclick = function(){
+    Array.prototype.forEach.call(document.querySelectorAll('.tab'), function(x){
+      x.classList.toggle('is-on', x === b);
+    });
+    $('#tabOne').hidden = b.dataset.tab !== 'one';
+    $('#tabStore').hidden = b.dataset.tab !== 'store';
+  };
+});
+
+function fmtSec(s){
+  return s < 60 ? (s + ' 秒') : (Math.round(s / 60) + ' 分钟');
+}
+
+function sEstimate(){
+  var n = parseInt($('#sCount').value, 10) || 0;
+  if (n <= 0) { $('#sEst').textContent = '填好数量后，这里会显示预计耗时和占用空间。'; return; }
+  var mb = n * 0.9;
+  var sec = Math.max(5, Math.round(n * 1.3));
+  var html = '预计 <b>' + n + '</b> 件，用时约 <b>' + fmtSec(sec) + '</b>，'
+    + '图片约 <b>' + mb.toFixed(0) + ' MB</b>。';
+  if (n > 100) html += '<br><span style="color:var(--dan)">数量较多，采集和上传都会比较慢，建议分几次采。</span>';
+  $('#sEst').innerHTML = html;
+}
+$('#sCount').oninput = sEstimate;
+$('#sCount').onchange = sEstimate;
+
+$('#sCheck').onclick = function(){
+  var u = $('#sUrl').value.trim();
+  if (!u) { showErr($('#sErr'), '请先粘贴店铺链接'); $('#sUrl').focus(); return; }
+  showErr($('#sErr'), '');
+  var b = $('#sCheck');
+  b.disabled = true; b.textContent = '读取中…';
+  api('/api/store/info', { url: u }).then(function(j){
+    b.disabled = false; b.textContent = '读取店铺';
+    if (!j.ok) {
+      showErr($('#sErr'), j.error || '读不到这个店铺');
+      $('#sInfo').classList.remove('on');
+      return;
+    }
+    var i = j.info || {};
+    $('#sInfo').innerHTML =
+      '<div><span class="nm">' + esc(i.shopName || '未命名店铺') + '</span>'
+      + (i.total ? '　共 <b>' + String(i.total).replace(/\B(?=(\d{3})+(?!\d))/g, ',') + '</b> 件商品' : '')
+      + '</div>'
+      + (i.desc ? '<div style="color:var(--ink3);margin-top:4px">' + esc(i.desc) + '</div>' : '')
+      + '<div style="color:var(--ink3);margin-top:7px;font-size:12px">按「最新发布」顺序采集，第一页读到 '
+      + (i.firstPage || 0) + ' 件</div>';
+    $('#sInfo').classList.add('on');
+    sEstimate();
+  }).catch(function(e){
+    b.disabled = false; b.textContent = '读取店铺';
+    showErr($('#sErr'), '读取失败：' + e.message);
+  });
+};
+
+$('#sUrl').addEventListener('keydown', function(e){
+  if (e.key === 'Enter') $('#sCheck').click();
+});
+
+$('#sGo').onclick = function(){
+  var u = $('#sUrl').value.trim();
+  if (!u) { showErr($('#sErr'), '请先粘贴店铺链接'); $('#sUrl').focus(); return; }
+  var n = parseInt($('#sCount').value, 10);
+  if (!(n >= 1 && n <= 200)) { showErr($('#sErr'), '采集数量请填 1–200 之间的数字'); $('#sCount').focus(); return; }
+  showErr($('#sErr'), '');
+  var b = $('#sGo');
+  b.disabled = true; b.textContent = '正在启动…';
+  api('/api/store/start', {
+    url: u,
+    count: n,
+    skip: parseInt($('#sSkip').value, 10) || 0,
+    category: $('#sCat').value,
+    skipExisting: $('#sSkipExist').checked,
+    translate: $('#sTranslate').checked,
+    allowEmptyTitle: $('#sEmpty').checked,
+    maxSide: 900
+  }).then(function(j){
+    if (!j.ok) {
+      b.disabled = false; b.textContent = '开始批量采集';
+      showErr($('#sErr'), j.error || '启动失败');
+      return;
+    }
+    $('#storeRun').hidden = false;
+    $('#sLog').textContent = '';
+    $('#sBar').style.width = '0%';
+    $('#sPhase').textContent = '· 连接店铺…';
+    if (STORE.timer) clearInterval(STORE.timer);
+    pollStore();
+    STORE.timer = setInterval(pollStore, 800);
+  }).catch(function(e){
+    b.disabled = false; b.textContent = '开始批量采集';
+    showErr($('#sErr'), '启动失败：' + e.message);
+  });
+};
+
+function pollStore(){
+  api('/api/store/progress').then(function(j){
+    if (!j.ok) return;
+    var job = j.job || {};
+    STORE.job = job;
+    renderStore(job);
+    if (!job.running) {
+      if (STORE.timer) { clearInterval(STORE.timer); STORE.timer = null; }
+      var b = $('#sGo');
+      b.disabled = false; b.textContent = '开始批量采集';
+      refreshStat();
+    }
+  }).catch(function(){});
+}
+
+function renderStore(job){
+  var total = job.total || 0, done = job.done || 0;
+  var pct = total ? Math.min(100, Math.round(done / total * 100)) : 0;
+  $('#sBar').style.width = pct + '%';
+  $('#sPhase').textContent = job.phase ? '· ' + job.phase : '';
+  $('#sStat').innerHTML =
+    '<span>进度 <b>' + done + ' / ' + total + '</b></span>'
+    + '<span class="ok">新增 <b>' + (job.added || 0) + '</b></span>'
+    + '<span class="sk">跳过 <b>' + (job.skipped || 0) + '</b></span>'
+    + '<span class="no">失败 <b>' + (job.failed || 0) + '</b></span>'
+    + (job.sizeText ? '<span>数据文件 <b>' + esc(job.sizeText) + '</b></span>' : '');
+  var el = $('#sLog');
+  var log = job.log || [];
+  var atBottom = el.scrollTop + el.clientHeight >= el.scrollHeight - 30;
+  el.textContent = log.join('\n');
+  if (atBottom) el.scrollTop = el.scrollHeight;
+  $('#sStop').disabled = !job.running;
+  if (job.error) showErr($('#sErr'), job.error);
+}
+
+$('#sStop').onclick = function(){
+  var b = this;
+  b.disabled = true;
+  api('/api/store/stop', {}).then(function(){
+    $('#sPhase').textContent = '· 正在停止，已采到的会保留…';
+  });
+};
+
 refreshStat();
 </script>
 <script src="assets/translate.js"></script>
@@ -1138,6 +1754,11 @@ class Handler(BaseHTTPRequestHandler):
                 return self._state()
             if p.path == '/api/img':
                 return self._proxy_img(q.get('u', [''])[0])
+            if p.path == '/api/store/progress':
+                with _STORE_LOCK:
+                    job = dict(STORE_JOB)
+                    job['log'] = list(STORE_JOB['log'])
+                return self._json({'ok': True, 'job': job})
             if p.path.startswith('/assets/') or p.path.startswith('/images/'):
                 return self._static(p.path)
             return self._json({'ok': False, 'error': 'not found'}, 404)
@@ -1155,6 +1776,12 @@ class Handler(BaseHTTPRequestHandler):
                 return self._do_compact()
             if p.path == '/api/translate':
                 return self._do_translate()
+            if p.path == '/api/store/info':
+                return self._do_store_info()
+            if p.path == '/api/store/start':
+                return self._do_store_start()
+            if p.path == '/api/store/stop':
+                return self._do_store_stop()
             return self._json({'ok': False, 'error': 'not found'}, 404)
         except Exception as e:
             return self._json({'ok': False, 'error': '%s: %s' % (type(e).__name__, e)})
@@ -1247,6 +1874,36 @@ class Handler(BaseHTTPRequestHandler):
             'rate': r['rate'],
             'missed': r['missed'],
         })
+
+    def _do_store_info(self):
+        b = self._read_body()
+        try:
+            info = fetch_store_info(b.get('url'))
+            return self._json({'ok': True, 'info': info})
+        except Exception as e:
+            return self._json({'ok': False, 'error': str(e)})
+
+    def _do_store_start(self):
+        b = self._read_body()
+        try:
+            start_store_job({
+                'url': b.get('url'),
+                'count': b.get('count'),
+                'skip': b.get('skip'),
+                'category': b.get('category'),
+                'translate': b.get('translate'),
+                'skipExisting': b.get('skipExisting'),
+                'allowEmptyTitle': b.get('allowEmptyTitle'),
+                'maxSide': b.get('maxSide'),
+            })
+            return self._json({'ok': True})
+        except Exception as e:
+            return self._json({'ok': False, 'error': str(e)})
+
+    def _do_store_stop(self):
+        _STORE_STOP.set()
+        _job_log('… 收到停止指令，正在收尾（已采的会保留）')
+        return self._json({'ok': True})
 
     def _do_compact(self):
         try:
